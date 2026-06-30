@@ -21,7 +21,13 @@ GP_PATH="${INDEX_PREFIX_PATH}GP_TIMES_${GP_TIMES}_LOCK_${GP_LOCK_NUMS}_CUT${GP_C
 GRAPH_PATH="${DATA_DIR}/gorgeous/${INDEX_PREFIX_PATH}GRAPH/"
 GRAPH_REP_INDEX_PATH="${DATA_DIR}/gorgeous/${INDEX_PREFIX_PATH}GRAPH_CACHE_INDEX/"
 GRAPH_GP_PATH="${GRAPH_PATH}GP_TIMES_${GP_TIMES}_LOCK_${GP_LOCK_NUMS}_CUT${GP_CUT}/"
+PACKING_POLICY=${PACKING_POLICY:-random}
+TRANSITION_SCORE_FILE=${TRANSITION_SCORE_FILE:-}
+REPLICA_LIMIT=${REPLICA_LIMIT:-0}
 GRAPH_CACHE_INDEX_GP_PATH="${GRAPH_REP_INDEX_PATH}GP_TIMES_${GP_TIMES}_LOCK_${GP_LOCK_NUMS}_CUT${GP_CUT}/"
+if [ "${PACKING_POLICY}" != "random" ] || [ ! "${REPLICA_LIMIT}" -eq 0 ]; then
+  GRAPH_CACHE_INDEX_GP_PATH="${GRAPH_REP_INDEX_PATH}GP_TIMES_${GP_TIMES}_LOCK_${GP_LOCK_NUMS}_CUT${GP_CUT}_PACK_${PACKING_POLICY}_RL_${REPLICA_LIMIT}/"
+fi
 
 SUMMARY_FILE_PATH="${DATA_DIR}/gorgeous/${INDEX_PREFIX_PATH}/summary.log"
 
@@ -181,7 +187,9 @@ case $2 in
       echo "Running graph partition... ${GP_FILE_PATH}.log"
       time ${EXE_PATH}/graph_partition/partitioner --index_file ${OLD_INDEX_FILE} \
         --data_type $GP_DATA_TYPE --gp_file $GP_FILE_PATH -T $GP_T --ldg_times $GP_TIMES\
-        --mode 3 --in_sector_len ${SECTOR_LEN} --out_sector_len ${GR_SECTOR_LEN} > ${GP_FILE_PATH}.log
+        --mode 3 --in_sector_len ${SECTOR_LEN} --out_sector_len ${GR_SECTOR_LEN} \
+        --packing_policy ${PACKING_POLICY} --transition_score_file "${TRANSITION_SCORE_FILE}" \
+        --replica_limit ${REPLICA_LIMIT} > ${GP_FILE_PATH}.log
 
       echo "Running relayout... ${GRAPH_CACHE_INDEX_GP_PATH}relayout.log"
       time ${EXE_PATH}/tests/utils/index_relayout_free_mem ${OLD_INDEX_FILE} ${GP_FILE_PATH} $GP_DATA_TYPE 3 ${SECTOR_LEN} ${GR_SECTOR_LEN} > ${GRAPH_CACHE_INDEX_GP_PATH}relayout.log

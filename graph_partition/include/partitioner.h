@@ -112,9 +112,15 @@ class graph_partitioner {
                     bool load_disk = true, unsigned BS = 1, bool visual = false,
                     std::string freq_file = std::string(""), unsigned cut = INF,
                     bool dist_replace_freq = false, Mode mode = Mode::ALL,
-                    unsigned diskann_sector_len = 4096, unsigned out_sector_len = 4096) {
+                    unsigned diskann_sector_len = 4096, unsigned out_sector_len = 4096,
+                    std::string packing_policy = std::string("random"),
+                    std::string transition_score_file = std::string(""),
+                    unsigned replica_limit = 0) {
     _visual = visual;
     mode_ = mode;
+    packing_policy_ = packing_policy;
+    transition_score_file_ = transition_score_file;
+    replica_limit_ = replica_limit;
     this->DISKANN_SECTOR_LEN = diskann_sector_len;
     this->OUTPUT_SECTOR_LEN = out_sector_len;
 
@@ -148,6 +154,9 @@ class graph_partitioner {
       }
     } else {
       load_vamana(indexName);
+    }
+    if (packing_policy_ == "history") {
+      load_transition_scores();
     }
     cursize = _nd / 1000;
 
@@ -438,6 +447,28 @@ class graph_partitioner {
     delete[] tmp;
     re_id2pid();
   }
+  void load_transition_scores() {
+    if (transition_score_file_.empty()) {
+      std::cout << "transition_score_file is required when packing_policy=history." << std::endl;
+      exit(-1);
+    }
+    if (!fs::exists(transition_score_file_)) {
+      std::cout << "No such transition_score_file: " << transition_score_file_ << std::endl;
+      exit(-1);
+    }
+    std::ifstream reader(transition_score_file_);
+    unsigned src = 0, dst = 0;
+    double score = 0;
+    while (reader >> src >> dst >> score) {
+      if (src >= _nd || dst >= _nd) continue;
+      auto &nbrs = full_graph[src];
+      if (std::find(nbrs.begin(), nbrs.end(), dst) == nbrs.end()) continue;
+      transition_scores_[src][dst] = score;
+    }
+    history_scored_nodes_ = transition_scores_.size();
+    std::cout << "loaded transition scores for " << history_scored_nodes_ << " source nodes." << std::endl;
+  }
+
   void re_id2pid() {
     id2pid.clear();
     for (unsigned i = 0; i < _partition_number; i++) {
@@ -817,7 +848,7 @@ class graph_partitioner {
   }
 
   // graph partition (light version)
-  // use random permutation to select neighbors
+  // use random permutation to select neighbors by default
   void light_graph_replicated_partition(int scale_factor) {
     if (n_primary_partition != _nd) {
       std::cout << "n_primary_partition != _nd, n_primary_partition: " \
@@ -843,27 +874,83 @@ class graph_partitioner {
       filled_nodes[i] = true;
     }
 
+    replica_limit_skipped_count_ = 0;
+    if (packing_policy_ == "random" && replica_limit_ == 0) {
 #pragma omp parallel for
-    for (int pid = 0; pid < _nd; pid++) {
-      std::vector<_u32> c_nbrs;
-      c_nbrs.reserve(64);
-      for (int i = 0; i < _partition[pid].size(); i++) {
-        for (unsigned s : full_graph[_partition[pid][i]]) {
-          c_nbrs.emplace_back(s);
-        }
-        auto rng = std::default_random_engine{};
-        std::shuffle(c_nbrs.begin(), c_nbrs.end(), rng);
-        for (int j = 0; j < c_nbrs.size(); j++) {
+      for (int pid = 0; pid < _nd; pid++) {
+        std::vector<_u32> c_nbrs;
+        c_nbrs.reserve(64);
+        for (int i = 0; i < _partition[pid].size(); i++) {
+          for (unsigned s : full_graph[_partition[pid][i]]) {
+            c_nbrs.emplace_back(s);
+          }
+          auto rng = std::default_random_engine{};
+          std::shuffle(c_nbrs.begin(), c_nbrs.end(), rng);
+          for (int j = 0; j < c_nbrs.size(); j++) {
+            if (_partition[pid].size() == C) {
+              break;
+            }
+            _partition[pid].push_back(c_nbrs[j]);
+          }
           if (_partition[pid].size() == C) {
             break;
           }
-          _partition[pid].push_back(c_nbrs[j]);
         }
-        if (_partition[pid].size() == C) {
-          break;
+      }
+    } else {
+      std::vector<unsigned> replica_count(_nd, 0);
+      for (unsigned pid = 0; pid < _nd; pid++) {
+        std::vector<_u32> c_nbrs;
+        c_nbrs.reserve(64);
+        const unsigned owner = pid;
+        for (int i = 0; i < _partition[pid].size(); i++) {
+          for (unsigned s : full_graph[_partition[pid][i]]) {
+            c_nbrs.emplace_back(s);
+          }
+          if (packing_policy_ == "history") {
+            auto score_it = transition_scores_.find(owner);
+            std::stable_sort(c_nbrs.begin(), c_nbrs.end(),
+              [&](const _u32 left, const _u32 right) {
+                bool left_scored = false, right_scored = false;
+                double left_score = 0, right_score = 0;
+                if (score_it != transition_scores_.end()) {
+                  auto lit = score_it->second.find(left);
+                  auto rit = score_it->second.find(right);
+                  left_scored = lit != score_it->second.end();
+                  right_scored = rit != score_it->second.end();
+                  if (left_scored) left_score = lit->second;
+                  if (right_scored) right_score = rit->second;
+                }
+                if (left_scored != right_scored) return left_scored;
+                if (left_scored && right_scored && left_score != right_score) return left_score > right_score;
+                return false;
+              });
+          } else {
+            auto rng = std::default_random_engine{};
+            std::shuffle(c_nbrs.begin(), c_nbrs.end(), rng);
+          }
+          for (int j = 0; j < c_nbrs.size(); j++) {
+            if (_partition[pid].size() == C) {
+              break;
+            }
+            unsigned s = c_nbrs[j];
+            if (replica_limit_ > 0 && s != owner && replica_count[s] >= replica_limit_) {
+              replica_limit_skipped_count_++;
+              continue;
+            }
+            _partition[pid].push_back(s);
+            if (replica_limit_ > 0 && s != owner) {
+              replica_count[s]++;
+            }
+          }
+          if (_partition[pid].size() == C) {
+            break;
+          }
         }
       }
     }
+
+    print_packing_stats();
   }
 
   // graph partition
@@ -911,6 +998,25 @@ class graph_partitioner {
     }
   }
 
+  void print_packing_stats() {
+    unsigned long long packed_total = 0;
+    unsigned long long used_slots = 0;
+    for (unsigned i = 0; i < _partition.size(); i++) {
+      if (_partition[i].empty()) continue;
+      packed_total += _partition[i].size() - 1;
+      used_slots += _partition[i].size();
+    }
+    double avg_packed = _nd == 0 ? 0.0 : static_cast<double>(packed_total) / static_cast<double>(_nd);
+    double fill_ratio = (_nd == 0 || C == 0) ? 0.0 : static_cast<double>(used_slots) / (static_cast<double>(_nd) * static_cast<double>(C));
+    std::cout << "packing_policy: " << packing_policy_ << std::endl;
+    std::cout << "transition_score_file: " << transition_score_file_ << std::endl;
+    std::cout << "replica_limit: " << replica_limit_ << std::endl;
+    std::cout << "avg packed adjacency per node: " << avg_packed << std::endl;
+    std::cout << "history scored nodes: " << history_scored_nodes_ << std::endl;
+    std::cout << "replica limit skipped count: " << replica_limit_skipped_count_ << std::endl;
+    std::cout << "page fill ratio: " << fill_ratio << std::endl;
+  }
+
  private:
   size_t _dim;  // vector dimension
   _u64 _nd;     // vector number
@@ -953,6 +1059,12 @@ class graph_partitioner {
   std::vector<std::vector<unsigned>> aux_id2pid;
   int _scale_factor;
   Mode mode_;
+  std::string packing_policy_;
+  std::string transition_score_file_;
+  unsigned replica_limit_ = 0;
+  unsigned long long replica_limit_skipped_count_ = 0;
+  unsigned long long history_scored_nodes_ = 0;
+  std::unordered_map<unsigned, std::unordered_map<unsigned, double>> transition_scores_;
 
   _u64 DISKANN_SECTOR_LEN;
   _u64 OUTPUT_SECTOR_LEN;

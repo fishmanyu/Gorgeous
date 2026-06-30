@@ -14,8 +14,8 @@
 
 int main(int argc, char **argv) {
   namespace po = boost::program_options;
-  std::string index_file, data_type, gp_file, freq_file;
-  unsigned block_size, ldg_times, lock_nums, thead_nums, cut, scale_factor, mode;
+  std::string index_file, data_type, gp_file, freq_file, packing_policy, transition_score_file;
+  unsigned block_size, ldg_times, lock_nums, thead_nums, cut, scale_factor, mode, replica_limit;
   bool use_disk, visual, dist_replace_freq;
   unsigned in_sector_len, out_sector_len;
 
@@ -45,6 +45,12 @@ int main(int argc, char **argv) {
     desc.add_options()("mode", po::value<unsigned>(&mode)->default_value(0), "0 for all, 1 for graph, 2 for emb");
     desc.add_options()("in_sector_len", po::value<unsigned>(&in_sector_len)->default_value(4096), "input sector len");
     desc.add_options()("out_sector_len", po::value<unsigned>(&out_sector_len)->default_value(4096), "output sector len");
+    desc.add_options()("packing_policy", po::value<std::string>(&packing_policy)->default_value("random"),
+                       "graph replica packing policy <random/history>");
+    desc.add_options()("transition_score_file", po::value<std::string>(&transition_score_file)->default_value(""),
+                       "transition score file: src_id dst_id score");
+    desc.add_options()("replica_limit", po::value<unsigned>(&replica_limit)->default_value(0),
+                       "max times an adjacency list can be copied to other nodes pages; 0 disables the limit");
 
     po::variables_map vm;
     po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -60,6 +66,18 @@ int main(int argc, char **argv) {
   if (dist_replace_freq) {
     std::cout << "Use distance replace freq." << std::endl;
   }
+  if (packing_policy == "distance") {
+    std::cerr << "packing_policy=distance is unsupported." << std::endl;
+    return 1;
+  }
+  if (packing_policy != "random" && packing_policy != "history") {
+    std::cerr << "unsupported packing_policy: " << packing_policy << std::endl;
+    return 1;
+  }
+  if (packing_policy == "history" && transition_score_file.empty()) {
+    std::cerr << "transition_score_file is required when packing_policy=history." << std::endl;
+    return 1;
+  }
   GP::Mode m = GP::Mode::ALL;
   if (mode == 1) {
     ldg_times = 1;
@@ -73,7 +91,8 @@ int main(int argc, char **argv) {
   std::cout << "scale factor: " << scale_factor << std::endl;
 
   GP::graph_partitioner partitioner(index_file.c_str(), data_type.c_str(), use_disk, block_size, visual,
-                                    freq_file, cut, dist_replace_freq, m, in_sector_len, out_sector_len);
+                                    freq_file, cut, dist_replace_freq, m, in_sector_len, out_sector_len,
+                                    packing_policy, transition_score_file, replica_limit);
   partitioner.graph_partition(gp_file.c_str(), ldg_times, scale_factor, lock_nums);
   return 0;
 }

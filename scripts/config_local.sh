@@ -29,6 +29,9 @@ GP_TIMES=16 # number of times to partition (Starling's configures)
 GP_T=64 # number of threads
 GP_LOCK_NUMS=0 # will lock nodes at init, the lock_node_nums = partition_size * GP_LOCK_NUMS
 GP_CUT=4096 # the graph's degree will been limited at 4096
+: ${PACKING_POLICY:=random} # graph-replicated packing policy: random or history
+: ${TRANSITION_SCORE_FILE:=} # src_id dst_id score TSV for history policy
+: ${REPLICA_LIMIT:=0} # 0 disables per-adjacency-list replica limiting
 
 ##############
 #   Search   #
