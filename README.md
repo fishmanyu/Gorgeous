@@ -22,6 +22,14 @@ git clone https://github.com/uxlfoundation/oneTBB.git
 cd oneTBB
 cmake --build .
 ```
+###### oneTBB简介
+# 专门给 C++ 做多核多线程任务调度的高性能库。
+# 普通多线程（pthread/std::thread）：
+# 你自己创建、销毁、同步线程，要操心线程数量、负载不均、锁竞争，写起来复杂。
+# oneTBB 完全换思路：
+# 1、你只拆分计算任务（逻辑块），不用管线程；
+# 2、内置工作窃取调度器（work-stealing），运行时自动分配任务到 CPU 线程；
+# 3、空闲线程会偷取其他线程没做完的任务，天然均衡多核负载，适配 NUMA、多插槽服务器。
 
 ### Running Benchmarks
 

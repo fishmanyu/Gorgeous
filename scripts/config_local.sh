@@ -3,7 +3,8 @@ source config_dataset.sh
 
 # Choose the dataset by uncomment the line below
 # If multiple lines are uncommented, only the last dataset is effective
-dataset_sift_learn
+# dataset_sift_learn
+dataset_wiki1m
 
 ##################
 #   Disk Build   #

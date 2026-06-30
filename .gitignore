@@ -1,0 +1,8 @@
+build/
+datasets/
+logs/
+*.o
+*.a
+*.so
+*.bin
+*.index
