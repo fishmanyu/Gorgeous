@@ -4,6 +4,8 @@
 #include "logger.h"
 #include "deco_index.h"
 #include <malloc.h>
+#include <fstream>
+#include <sys/stat.h>
 #include "percentile_stats.h"
 
 #include <omp.h>
@@ -128,6 +130,19 @@ namespace diskann {
       delete scratch.page_visited;
     }
     this->io_manager->deregister_all_threads();
+  }
+
+  template<typename T>
+  void DecoIndex<T>::enable_transition_trace(bool enabled, const std::string &trace_file) {
+    collect_transition_trace_ = enabled;
+    transition_trace_file_ = trace_file;
+    if (!collect_transition_trace_) {
+      return;
+    }
+    mkdir("logs", 0755);
+    std::lock_guard<std::mutex> lock(transition_trace_mutex_);
+    std::ofstream writer(transition_trace_file_, std::ios::out);
+    writer << "query_id,expand_order,parent,current,neighbor,accepted,pq_dist,is_replica\n";
   }
 
   template<typename T>

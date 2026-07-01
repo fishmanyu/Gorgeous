@@ -302,6 +302,7 @@ case $2 in
               --disk_graph_prefix ${GRAPH_PATH} \
               --deco_impl ${DECO_IMPL} \
               --use_graph_rep_index ${USE_DISK_GRAPH_CACHE_INDEX} \
+              --collect_transition_trace ${COLLECT_TRANSITION_TRACE} \
               --mem_graph_use_ratio ${MEM_GRAPH_USE_RATIO} \
               --mem_emb_use_ratio ${MEM_EMB_USE_RATIO} \
               --emb_search_ratio ${EMB_SEARCH_RATIO} > ${SEARCH_LOG}"
@@ -332,6 +333,7 @@ case $2 in
               --disk_graph_prefix ${GRAPH_PATH} \
               --deco_impl ${DECO_IMPL} \
               --use_graph_rep_index ${USE_DISK_GRAPH_CACHE_INDEX} \
+              --collect_transition_trace ${COLLECT_TRANSITION_TRACE} \
               --mem_graph_use_ratio ${MEM_GRAPH_USE_RATIO} \
               --mem_emb_use_ratio ${MEM_EMB_USE_RATIO} \
               --emb_search_ratio ${EMB_SEARCH_RATIO} > ${SEARCH_LOG}

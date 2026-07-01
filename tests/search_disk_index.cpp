@@ -69,7 +69,8 @@ int search_disk_index(
     const bool use_graph_rep_index = false,
     const float mem_graph_use_ratio = 1.0,
     const float mem_emb_use_ratio = 1.0,
-    const float emb_search_ratio = 1.0) {
+    const float emb_search_ratio = 1.0,
+    const bool collect_transition_trace = false) {
   diskann::cout << "Search parameters: #threads: " << num_threads << ", ";
   if (beamwidth <= 0)
     diskann::cout << "beamwidth to be optimized for each L value" << std::flush;
@@ -124,6 +125,9 @@ int search_disk_index(
 
   if (res != 0) {
     return res;
+  }
+  if (deco_impl) {
+    _decoIndex->enable_transition_trace(collect_transition_trace);
   }
 
   // load in-memory navigation graph
@@ -379,6 +383,7 @@ int main(int argc, char** argv) {
   float                 pq_ratio = 1.0;
   bool deco_impl = false;
   bool use_graph_rep_index = false;
+  bool collect_transition_trace = false;
   float mem_graph_use_ratio = 0.0;
   float mem_emb_use_ratio = 0.0;
   float emb_search_ratio = 1.0;
@@ -454,6 +459,8 @@ int main(int argc, char** argv) {
                        "The percentage of how many vectors in a page to search each time");
     desc.add_options()("use_graph_rep_index", po::value<bool>(&use_graph_rep_index)->default_value(0),
                        "whether use graph cache index");
+    desc.add_options()("collect_transition_trace", po::value<bool>(&collect_transition_trace)->default_value(0),
+                       "whether collect graph traversal trace to logs/search_trace.csv");
     desc.add_options()("mem_graph_use_ratio", po::value<float>(&mem_graph_use_ratio)->default_value(1.0f),
                        "ratio of using memory graph");
     desc.add_options()("mem_emb_use_ratio", po::value<float>(&mem_emb_use_ratio)->default_value(1.0f),
@@ -523,21 +530,21 @@ int main(int argc, char** argv) {
           query_file, gt_file, disk_file_path, disk_graph_prefix, graph_rep_index_prefix,
           num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec, mem_L, sector_len,
           use_page_search, use_ratio, pq_ratio, deco_impl,
-          use_graph_rep_index, mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio);
+          use_graph_rep_index, mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace);
     else if (data_type == std::string("int8"))
       return search_disk_index<int8_t>(
           metric, index_path_prefix, pq_path_prefix, mem_index_path, mem_sample_path, result_path_prefix,
           query_file, gt_file, disk_file_path, disk_graph_prefix, graph_rep_index_prefix,
           num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec, mem_L, sector_len,
           use_page_search, use_ratio, pq_ratio, deco_impl,
-          use_graph_rep_index, mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio);
+          use_graph_rep_index, mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace);
     else if (data_type == std::string("uint8"))
       return search_disk_index<uint8_t>(
           metric, index_path_prefix, pq_path_prefix, mem_index_path, mem_sample_path, result_path_prefix,
           query_file, gt_file, disk_file_path, disk_graph_prefix, graph_rep_index_prefix,
           num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec, mem_L, sector_len,
           use_page_search, use_ratio, pq_ratio, deco_impl,
-          use_graph_rep_index, mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio);
+          use_graph_rep_index, mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace);
     else {
       std::cerr << "Unsupported data type. Use float or int8 or uint8"
                 << std::endl;

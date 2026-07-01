@@ -4,6 +4,8 @@
 #pragma once
 #include <cassert>
 #include <sstream>
+#include <fstream>
+#include <mutex>
 #include <stack>
 #include <string>
 #include "tsl/robin_map.h"
@@ -65,6 +67,9 @@ namespace diskann {
         const _u64 l_search, std::vector<_u64>& indices_vec, std::vector<float>& distances_vec,
         const _u64 beam_width, const _u32 io_limit,
         const float pq_filter_ratio = 1.2f, const float emb_search_ratio = 1.0f, QueryStats *stats = nullptr);
+
+    DISKANN_DLLEXPORT void enable_transition_trace(bool enabled,
+                                                   const std::string &trace_file = "logs/search_trace.csv");
 
     std::shared_ptr<FileIOManager> &io_manager;
 
@@ -166,6 +171,10 @@ namespace diskann {
 
     // page search
     bool use_graph_rep_index_;
+
+    bool collect_transition_trace_ = false;
+    std::string transition_trace_file_ = "logs/search_trace.csv";
+    std::mutex transition_trace_mutex_;
     // id2 graph partition page and gp layout.
     std::vector<unsigned> id2page_;
     std::vector<std::vector<unsigned>> gp_layout_;

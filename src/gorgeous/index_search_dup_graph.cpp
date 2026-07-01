@@ -12,11 +12,15 @@ namespace diskann {
     unsigned id;
     unsigned nb_size;
     unsigned* node_nbrs;
+    unsigned parent_id;
+    bool is_replica;
 
-    CacheNode(unsigned id, unsigned nb_size, unsigned* node_nbrs) {
+    CacheNode(unsigned id, unsigned nb_size, unsigned* node_nbrs, unsigned parent_id = INF, bool is_replica = false) {
       this->id = id;
       this->nb_size = nb_size;
-      this->node_nbrs = node_nbrs;  
+      this->node_nbrs = node_nbrs;
+      this->parent_id = parent_id;
+      this->is_replica = is_replica;
     }
   };
 
@@ -56,6 +60,7 @@ namespace diskann {
       tsl::robin_set<_u32> &page_visited = *(query_scratch->page_visited);
       tsl::robin_set<_u32> &visited = *(query_scratch->visited);
       tsl::robin_map<_u32, char*> loaded; // loaded nodes by cached.
+      tsl::robin_map<_u32, unsigned> loaded_parent;
       loaded.reserve(2048);
 
       // this is a ring queue for storing sector buffers ptr.
@@ -84,6 +89,9 @@ namespace diskann {
         _u64* indices = indices_vec.data() + (task_id * k_search);
         float* distances = distances_vec.data() + (task_id * k_search);
         QueryStats* stats = stats_ptr + task_id;
+        const bool collect_trace = collect_transition_trace_;
+        std::ostringstream trace_rows;
+        unsigned expand_order = 0;
 
         _mm_prefetch((char *) query1, _MM_HINT_T1);
         // copy query to thread specific aligned and allocated memory (for distance
@@ -108,6 +116,7 @@ namespace diskann {
         // reset query
         query_scratch->reset();
         loaded.clear();
+        loaded_parent.clear();
 
         // query <-> PQ chunk centers distances
         pq_table.populate_chunk_distances(query_float, pq_dists);
@@ -150,7 +159,17 @@ namespace diskann {
           return r;
         };
 
-        auto compute_and_push_nbrs = [&](const char *node_buf) {
+        auto append_trace_row = [&](const unsigned order, const unsigned parent_id, const unsigned current_id,
+                                    const unsigned neighbor_id, const bool accepted,
+                                    const float pq_dist, const bool is_replica) {
+          if (!collect_trace) return;
+          trace_rows << task_id << "," << order << "," << parent_id << "," << current_id << ","
+                     << neighbor_id << "," << (accepted ? 1 : 0) << "," << pq_dist << ","
+                     << (is_replica ? 1 : 0) << "\n";
+        };
+
+        auto compute_and_push_nbrs = [&](const char *node_buf, const unsigned current_id,
+                                         const unsigned parent_id, const bool is_replica) {
           unsigned *node_nbrs = (unsigned*)node_buf;
           unsigned nnbrs = *(node_nbrs++);
           unsigned nbors_cand_size = 0;
@@ -159,6 +178,7 @@ namespace diskann {
               nbr_buf[nbors_cand_size++] = node_nbrs[m];
             }
           }
+          const unsigned order = collect_trace ? expand_order++ : 0;
           if (nbors_cand_size) {
             _mm_prefetch((char *) nbr_buf.data(), _MM_HINT_T1);
             compute_pq_dists(nbr_buf.data(), nbors_cand_size, dist_scratch);
@@ -168,12 +188,14 @@ namespace diskann {
             for (unsigned m = 0; m < nbors_cand_size; ++m) {
               const unsigned nbor_id = nbr_buf[m];
               const float nbor_dist = dist_scratch[m];
-              add_to_retset(nbor_id, nbor_dist, true);
+              auto r = add_to_retset(nbor_id, nbor_dist, true);
+              if (collect_trace) append_trace_row(order, parent_id, current_id, nbor_id, r != INF, nbor_dist, is_replica);
             }
           }
         };
 
-        auto compute_and_push_nbrs_target_update = [&](const char *node_buf) {
+        auto compute_and_push_nbrs_target_update = [&](const char *node_buf, const unsigned current_id,
+                                                       const unsigned parent_id, const bool is_replica) {
           unsigned *node_nbrs = (unsigned*)node_buf;
           unsigned nnbrs = *(node_nbrs++);
           unsigned nbors_cand_size = 0;
@@ -182,6 +204,7 @@ namespace diskann {
               nbr_buf[nbors_cand_size++] = node_nbrs[m];
             }
           }
+          const unsigned order = collect_trace ? expand_order++ : 0;
           if (nbors_cand_size) {
             _mm_prefetch((char *) nbr_buf.data(), _MM_HINT_T1);
             compute_pq_dists(nbr_buf.data(), nbors_cand_size, dist_scratch);
@@ -193,6 +216,7 @@ namespace diskann {
               const unsigned nbor_id = nbr_buf[m];
               const float nbor_dist = dist_scratch[m];
               auto r = add_to_retset(nbor_id, nbor_dist, true);
+              if (collect_trace) append_trace_row(order, parent_id, current_id, nbor_id, r != INF, nbor_dist, is_replica);
               if (dist_scratch[m] < retset[cur_list_size - 1].distance * pq_filter_ratio &&
                   loaded.find(nbor_id) != loaded.end()) {
                 expand_nb_ids.push_back(nbor_id);
@@ -202,7 +226,7 @@ namespace diskann {
               }
             }
             for (unsigned m = 0; m < expand_nb_ids.size(); m++) {
-              compute_and_push_nbrs(loaded[expand_nb_ids[m]]);
+              compute_and_push_nbrs(loaded[expand_nb_ids[m]], expand_nb_ids[m], current_id, true);
             }
           }
         };
@@ -266,10 +290,11 @@ namespace diskann {
               if (node_in_mem_pos(p_layout[j]) == INF) {
                 char *nnbr_buf = node_buf + j * graph_node_len;
                 loaded.insert({p_layout[j], nnbr_buf});
+                loaded_parent.insert({p_layout[j], exact_id});
               }
             }
             // expand neighbors for target node.
-            compute_and_push_nbrs_target_update(node_buf);
+            compute_and_push_nbrs_target_update(node_buf, exact_id, INF, false);
             if (stats != nullptr) stats->disk_proc_us += (double) part_timer.elapsed();
 
             sec_buf2ftr.erase(sector_buf);
@@ -287,6 +312,7 @@ namespace diskann {
                 nbr_buf[nbors_size++] = cn->node_nbrs[m];
               }
             }
+            const unsigned order = collect_trace ? expand_order++ : 0;
             compute_pq_dists(nbr_buf.data(), nbors_size, dist_scratch);
             if (stats != nullptr) {
               stats->n_cmps += (double) nbors_size;
@@ -294,7 +320,8 @@ namespace diskann {
             for (unsigned m = 0; m < nbors_size; ++m) {
               const unsigned nbor_id = nbr_buf[m];
               const float nbor_dist = dist_scratch[m];
-              add_to_retset(nbor_id, nbor_dist, true);
+              auto r = add_to_retset(nbor_id, nbor_dist, true);
+              if (collect_trace) append_trace_row(order, cn->parent_id, cn->id, nbor_id, r != INF, nbor_dist, cn->is_replica);
             }
             n_cached_in_q--;
             if (stats != nullptr) stats->cache_proc_us += (double) part_timer.elapsed();
@@ -340,7 +367,7 @@ namespace diskann {
                 } else if (loaded.find(id) != loaded.end()) {
                   unsigned* node_nbrs = (unsigned*)loaded[id];
                   unsigned nb_size = *(node_nbrs++);
-                  cached_node.push(std::make_shared<CacheNode>(id, nb_size, node_nbrs));
+                  cached_node.push(std::make_shared<CacheNode>(id, nb_size, node_nbrs, loaded_parent.find(id) == loaded_parent.end() ? INF : loaded_parent[id], true));
                   num_seen++;
                   n_cached_in_q++;
                 } else {
@@ -476,6 +503,11 @@ namespace diskann {
         if (stats != nullptr) {
           stats->total_us = (double) query_timer.elapsed();
           stats->postprocess_us = (double) part_timer.elapsed();
+        }
+        if (collect_trace && trace_rows.tellp() > 0) {
+          std::lock_guard<std::mutex> lock(transition_trace_mutex_);
+          std::ofstream writer(transition_trace_file_, std::ios::app);
+          writer << trace_rows.str();
         }
       }
     });

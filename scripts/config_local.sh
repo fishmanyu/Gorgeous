@@ -50,6 +50,7 @@ MEM_EMB_USE_RATIO=0.0           # embedding cached ratio
 EMB_SEARCH_RATIO=0.4            # ratio of embedding being search when using mem graph
 USE_DISK_GRAPH_CACHE_INDEX=1    # new index with cache neighbor graph in a page.
 PQ_FILTER_RATIO=0.9             # Gorgeous PQ filter ratio
+COLLECT_TRANSITION_TRACE=1      # Set 1 to write logs/search_trace.csv during graph-replicated search
 
 # Page Search (Starling's configures)
 USE_PAGE_SEARCH=1               # Set 0 for beam search, 1 for page search (Starling)
