@@ -142,7 +142,7 @@ namespace diskann {
     mkdir("logs", 0755);
     std::lock_guard<std::mutex> lock(transition_trace_mutex_);
     std::ofstream writer(transition_trace_file_, std::ios::out);
-    writer << "query_id,expand_order,parent,current,neighbor,accepted,pq_dist,is_replica\n";
+    writer << "query_id,expand_order,parent,current,neighbor,accepted,pq_dist,is_replica,later_expanded,depth_from_entry\n";
   }
 
   template<typename T>

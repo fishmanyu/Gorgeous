@@ -24,6 +24,18 @@ namespace diskann {
     }
   };
 
+  struct TransitionTraceRow {
+    size_t query_id;
+    unsigned expand_order;
+    unsigned parent;
+    unsigned current;
+    unsigned neighbor;
+    bool accepted;
+    float pq_dist;
+    bool is_replica;
+    unsigned depth_from_entry;
+  };
+
   // data could be parse streamingly from queue.
   template<typename T>
   void DecoIndex<T>::page_search_dup_graph(
@@ -90,7 +102,9 @@ namespace diskann {
         float* distances = distances_vec.data() + (task_id * k_search);
         QueryStats* stats = stats_ptr + task_id;
         const bool collect_trace = collect_transition_trace_;
-        std::ostringstream trace_rows;
+        std::vector<TransitionTraceRow> trace_rows;
+        tsl::robin_set<_u32> trace_expanded;
+        tsl::robin_map<_u32, unsigned> trace_depth;
         unsigned expand_order = 0;
 
         _mm_prefetch((char *) query1, _MM_HINT_T1);
@@ -159,13 +173,27 @@ namespace diskann {
           return r;
         };
 
+        auto begin_trace_expand = [&](const unsigned current_id, const unsigned parent_id) -> unsigned {
+          if (!collect_trace) return 0;
+          if (trace_depth.find(current_id) == trace_depth.end()) {
+            auto parent_depth = trace_depth.find(parent_id);
+            trace_depth[current_id] = parent_depth == trace_depth.end() ? 0 : parent_depth->second + 1;
+          }
+          trace_expanded.insert(current_id);
+          return expand_order++;
+        };
+
         auto append_trace_row = [&](const unsigned order, const unsigned parent_id, const unsigned current_id,
                                     const unsigned neighbor_id, const bool accepted,
                                     const float pq_dist, const bool is_replica) {
           if (!collect_trace) return;
-          trace_rows << task_id << "," << order << "," << parent_id << "," << current_id << ","
-                     << neighbor_id << "," << (accepted ? 1 : 0) << "," << pq_dist << ","
-                     << (is_replica ? 1 : 0) << "\n";
+          auto current_depth = trace_depth.find(current_id);
+          unsigned depth = current_depth == trace_depth.end() ? 0 : current_depth->second;
+          if (accepted && trace_depth.find(neighbor_id) == trace_depth.end()) {
+            trace_depth[neighbor_id] = depth + 1;
+          }
+          trace_rows.push_back({task_id, order, parent_id, current_id, neighbor_id, accepted, pq_dist,
+                                is_replica, depth});
         };
 
         auto compute_and_push_nbrs = [&](const char *node_buf, const unsigned current_id,
@@ -178,7 +206,7 @@ namespace diskann {
               nbr_buf[nbors_cand_size++] = node_nbrs[m];
             }
           }
-          const unsigned order = collect_trace ? expand_order++ : 0;
+          const unsigned order = begin_trace_expand(current_id, parent_id);
           if (nbors_cand_size) {
             _mm_prefetch((char *) nbr_buf.data(), _MM_HINT_T1);
             compute_pq_dists(nbr_buf.data(), nbors_cand_size, dist_scratch);
@@ -204,7 +232,7 @@ namespace diskann {
               nbr_buf[nbors_cand_size++] = node_nbrs[m];
             }
           }
-          const unsigned order = collect_trace ? expand_order++ : 0;
+          const unsigned order = begin_trace_expand(current_id, parent_id);
           if (nbors_cand_size) {
             _mm_prefetch((char *) nbr_buf.data(), _MM_HINT_T1);
             compute_pq_dists(nbr_buf.data(), nbors_cand_size, dist_scratch);
@@ -312,7 +340,7 @@ namespace diskann {
                 nbr_buf[nbors_size++] = cn->node_nbrs[m];
               }
             }
-            const unsigned order = collect_trace ? expand_order++ : 0;
+            const unsigned order = begin_trace_expand(cn->id, cn->parent_id);
             compute_pq_dists(nbr_buf.data(), nbors_size, dist_scratch);
             if (stats != nullptr) {
               stats->n_cmps += (double) nbors_size;
@@ -504,10 +532,16 @@ namespace diskann {
           stats->total_us = (double) query_timer.elapsed();
           stats->postprocess_us = (double) part_timer.elapsed();
         }
-        if (collect_trace && trace_rows.tellp() > 0) {
+        if (collect_trace && !trace_rows.empty()) {
           std::lock_guard<std::mutex> lock(transition_trace_mutex_);
           std::ofstream writer(transition_trace_file_, std::ios::app);
-          writer << trace_rows.str();
+          for (const auto &row : trace_rows) {
+            const bool later_expanded = trace_expanded.find(row.neighbor) != trace_expanded.end();
+            writer << row.query_id << "," << row.expand_order << "," << row.parent << ","
+                   << row.current << "," << row.neighbor << "," << (row.accepted ? 1 : 0)
+                   << "," << row.pq_dist << "," << (row.is_replica ? 1 : 0) << ","
+                   << (later_expanded ? 1 : 0) << "," << row.depth_from_entry << "\n";
+          }
         }
       }
     });
