@@ -33,6 +33,7 @@ namespace diskann {
     bool accepted;
     float pq_dist;
     bool is_replica;
+    bool graph_io;
     unsigned depth_from_entry;
   };
 
@@ -185,7 +186,7 @@ namespace diskann {
 
         auto append_trace_row = [&](const unsigned order, const unsigned parent_id, const unsigned current_id,
                                     const unsigned neighbor_id, const bool accepted,
-                                    const float pq_dist, const bool is_replica) {
+                                    const float pq_dist, const bool is_replica, const bool graph_io) {
           if (!collect_trace) return;
           auto current_depth = trace_depth.find(current_id);
           unsigned depth = current_depth == trace_depth.end() ? 0 : current_depth->second;
@@ -193,11 +194,11 @@ namespace diskann {
             trace_depth[neighbor_id] = depth + 1;
           }
           trace_rows.push_back({task_id, order, parent_id, current_id, neighbor_id, accepted, pq_dist,
-                                is_replica, depth});
+                                is_replica, graph_io, depth});
         };
 
         auto compute_and_push_nbrs = [&](const char *node_buf, const unsigned current_id,
-                                         const unsigned parent_id, const bool is_replica) {
+                                         const unsigned parent_id, const bool is_replica, const bool graph_io) {
           unsigned *node_nbrs = (unsigned*)node_buf;
           unsigned nnbrs = *(node_nbrs++);
           unsigned nbors_cand_size = 0;
@@ -217,13 +218,15 @@ namespace diskann {
               const unsigned nbor_id = nbr_buf[m];
               const float nbor_dist = dist_scratch[m];
               auto r = add_to_retset(nbor_id, nbor_dist, true);
-              if (collect_trace) append_trace_row(order, parent_id, current_id, nbor_id, r != INF, nbor_dist, is_replica);
+              if (collect_trace) append_trace_row(order, parent_id, current_id, nbor_id, r != INF, nbor_dist, is_replica, graph_io);
             }
+          } else if (collect_trace) {
+            append_trace_row(order, parent_id, current_id, INF, false, 0.0f, is_replica, graph_io);
           }
         };
 
         auto compute_and_push_nbrs_target_update = [&](const char *node_buf, const unsigned current_id,
-                                                       const unsigned parent_id, const bool is_replica) {
+                                                       const unsigned parent_id, const bool is_replica, const bool graph_io) {
           unsigned *node_nbrs = (unsigned*)node_buf;
           unsigned nnbrs = *(node_nbrs++);
           unsigned nbors_cand_size = 0;
@@ -244,7 +247,7 @@ namespace diskann {
               const unsigned nbor_id = nbr_buf[m];
               const float nbor_dist = dist_scratch[m];
               auto r = add_to_retset(nbor_id, nbor_dist, true);
-              if (collect_trace) append_trace_row(order, parent_id, current_id, nbor_id, r != INF, nbor_dist, is_replica);
+              if (collect_trace) append_trace_row(order, parent_id, current_id, nbor_id, r != INF, nbor_dist, is_replica, graph_io);
               if (dist_scratch[m] < retset[cur_list_size - 1].distance * pq_filter_ratio &&
                   loaded.find(nbor_id) != loaded.end()) {
                 expand_nb_ids.push_back(nbor_id);
@@ -254,8 +257,10 @@ namespace diskann {
               }
             }
             for (unsigned m = 0; m < expand_nb_ids.size(); m++) {
-              compute_and_push_nbrs(loaded[expand_nb_ids[m]], expand_nb_ids[m], current_id, true);
+              compute_and_push_nbrs(loaded[expand_nb_ids[m]], expand_nb_ids[m], current_id, true, false);
             }
+          } else if (collect_trace) {
+            append_trace_row(order, parent_id, current_id, INF, false, 0.0f, is_replica, graph_io);
           }
         };
 
@@ -322,7 +327,7 @@ namespace diskann {
               }
             }
             // expand neighbors for target node.
-            compute_and_push_nbrs_target_update(node_buf, exact_id, INF, false);
+            compute_and_push_nbrs_target_update(node_buf, exact_id, INF, false, true);
             if (stats != nullptr) stats->disk_proc_us += (double) part_timer.elapsed();
 
             sec_buf2ftr.erase(sector_buf);
@@ -349,7 +354,10 @@ namespace diskann {
               const unsigned nbor_id = nbr_buf[m];
               const float nbor_dist = dist_scratch[m];
               auto r = add_to_retset(nbor_id, nbor_dist, true);
-              if (collect_trace) append_trace_row(order, cn->parent_id, cn->id, nbor_id, r != INF, nbor_dist, cn->is_replica);
+              if (collect_trace) append_trace_row(order, cn->parent_id, cn->id, nbor_id, r != INF, nbor_dist, cn->is_replica, false);
+            }
+            if (nbors_size == 0 && collect_trace) {
+              append_trace_row(order, cn->parent_id, cn->id, INF, false, 0.0f, cn->is_replica, false);
             }
             n_cached_in_q--;
             if (stats != nullptr) stats->cache_proc_us += (double) part_timer.elapsed();
@@ -540,7 +548,8 @@ namespace diskann {
             writer << row.query_id << "," << row.expand_order << "," << row.parent << ","
                    << row.current << "," << row.neighbor << "," << (row.accepted ? 1 : 0)
                    << "," << row.pq_dist << "," << (row.is_replica ? 1 : 0) << ","
-                   << (later_expanded ? 1 : 0) << "," << row.depth_from_entry << "\n";
+                   << (later_expanded ? 1 : 0) << "," << row.depth_from_entry << ","
+                   << (row.graph_io ? 1 : 0) << "\n";
           }
         }
       }

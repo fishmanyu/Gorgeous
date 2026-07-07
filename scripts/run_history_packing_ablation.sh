@@ -9,6 +9,7 @@ DATASET="${DATASET:-wiki1m}"
 BUILD_TYPE="${BUILD_TYPE:-release}"
 TRANSITION_SCORE_FILE="${TRANSITION_SCORE_FILE:-/home/yqr/work/data/gorgeous/logs/transition_scores.tsv}"
 REPLICA_LIMIT="${REPLICA_LIMIT:-0}"
+COLLECT_TRACE_FOR_IO="${COLLECT_TRACE_FOR_IO:-0}"
 EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-/home/yqr/work/data/gorgeous/experiments/history_packing_$(date +%Y%m%d_%H%M%S)}"
 
 CONFIG_LOCAL="${SCRIPT_DIR}/config_local.sh"
@@ -39,19 +40,20 @@ case "${DATASET}" in
     ;;
 esac
 
-python3 - "${CONFIG_LOCAL}" "${DATASET_FUNC}" <<'PY'
+python3 - "${CONFIG_LOCAL}" "${DATASET_FUNC}" "${COLLECT_TRACE_FOR_IO}" <<'PY'
 from pathlib import Path
 import re
 import sys
 
 path = Path(sys.argv[1])
 dataset_func = sys.argv[2]
+collect_trace = sys.argv[3]
 text = path.read_text()
 text = re.sub(r'(?m)^dataset_(sift_learn|wiki1m)\s*$', f'{dataset_func}', text)
 if 'COLLECT_TRANSITION_TRACE=' in text:
-    text = re.sub(r'(?m)^COLLECT_TRANSITION_TRACE=.*$', 'COLLECT_TRANSITION_TRACE=0', text)
+    text = re.sub(r'(?m)^COLLECT_TRANSITION_TRACE=.*$', f'COLLECT_TRANSITION_TRACE={collect_trace}', text)
 else:
-    text += '\nCOLLECT_TRANSITION_TRACE=0\n'
+    text += f'\nCOLLECT_TRANSITION_TRACE={collect_trace}\n'
 path.write_text(text)
 PY
 
@@ -156,6 +158,15 @@ run_search() {
     echo "Expected search log not found: ${SEARCH_LOG}" >&2
     exit 1
   fi
+  if [ "${COLLECT_TRANSITION_TRACE}" -eq 1 ]; then
+    local trace_file="${DATA_DIR}/gorgeous/logs/search_trace.csv"
+    if [ -f "${trace_file}" ]; then
+      cp "${trace_file}" "${EXPERIMENT_ROOT}/logs/${policy}_search_trace.csv"
+    else
+      echo "Expected trace file not found: ${trace_file}" >&2
+      exit 1
+    fi
+  fi
 }
 
 extract_metrics() {
@@ -248,6 +259,7 @@ PY
   echo "USE_PAGE_SEARCH=${USE_PAGE_SEARCH}"
   echo "PQ_FILTER_RATIO=${PQ_FILTER_RATIO}"
   echo "COLLECT_TRANSITION_TRACE=${COLLECT_TRANSITION_TRACE}"
+  echo "COLLECT_TRACE_FOR_IO=${COLLECT_TRACE_FOR_IO}"
 } | tee "${EXPERIMENT_ROOT}/experiment_config.txt"
 
 save_existing_layout_dir "${RANDOM_LAYOUT_DIR}" random

@@ -115,12 +115,16 @@ class graph_partitioner {
                     unsigned diskann_sector_len = 4096, unsigned out_sector_len = 4096,
                     std::string packing_policy = std::string("random"),
                     std::string transition_score_file = std::string(""),
-                    unsigned replica_limit = 0) {
+                    unsigned replica_limit = 0,
+                    unsigned cohistory_window = 2,
+                    double cohistory_dup_penalty = 0.1) {
     _visual = visual;
     mode_ = mode;
     packing_policy_ = packing_policy;
     transition_score_file_ = transition_score_file;
     replica_limit_ = replica_limit;
+    cohistory_window_ = cohistory_window == 0 ? 1 : cohistory_window;
+    cohistory_dup_penalty_ = cohistory_dup_penalty;
     this->DISKANN_SECTOR_LEN = diskann_sector_len;
     this->OUTPUT_SECTOR_LEN = out_sector_len;
 
@@ -155,7 +159,7 @@ class graph_partitioner {
     } else {
       load_vamana(indexName);
     }
-    if (packing_policy_ == "history") {
+    if (packing_policy_ == "history" || packing_policy_ == "cohistory") {
       load_transition_scores();
     }
     cursize = _nd / 1000;
@@ -449,7 +453,7 @@ class graph_partitioner {
   }
   void load_transition_scores() {
     if (transition_score_file_.empty()) {
-      std::cout << "transition_score_file is required when packing_policy=history." << std::endl;
+      std::cout << "transition_score_file is required when packing_policy=" << packing_policy_ << "." << std::endl;
       exit(-1);
     }
     if (!fs::exists(transition_score_file_)) {
@@ -847,6 +851,135 @@ class graph_partitioner {
     return pid;
   }
 
+  struct CohistoryCandidate {
+    unsigned id = 0;
+    bool scored = false;
+    double score = 0.0;
+    unsigned random_rank = 0;
+  };
+
+  std::vector<CohistoryCandidate> build_cohistory_candidates(unsigned owner) {
+    std::vector<_u32> shuffled;
+    shuffled.reserve(full_graph[owner].size());
+    for (unsigned s : full_graph[owner]) {
+      shuffled.emplace_back(s);
+    }
+    auto rng = std::default_random_engine{};
+    std::shuffle(shuffled.begin(), shuffled.end(), rng);
+
+    std::vector<CohistoryCandidate> out;
+    out.reserve(shuffled.size());
+    auto score_it = transition_scores_.find(owner);
+    for (unsigned i = 0; i < shuffled.size(); ++i) {
+      CohistoryCandidate c;
+      c.id = shuffled[i];
+      c.random_rank = i;
+      if (score_it != transition_scores_.end()) {
+        auto it = score_it->second.find(c.id);
+        if (it != score_it->second.end()) {
+          c.scored = true;
+          c.score = it->second;
+        }
+      }
+      out.push_back(c);
+    }
+    return out;
+  }
+
+  void cohistory_graph_replicated_partition(std::vector<unsigned> &replica_count) {
+    cohistory_duplicate_count_ = 0;
+    cohistory_avoided_duplicate_count_ = 0;
+    cohistory_unique_packed_total_ = 0;
+    cohistory_group_count_ = 0;
+
+    for (unsigned group_start = 0; group_start < _nd; group_start += cohistory_window_) {
+      unsigned group_end = std::min<unsigned>(_nd, group_start + cohistory_window_);
+      std::vector<std::vector<CohistoryCandidate>> candidates(group_end - group_start);
+      std::vector<double> max_scores(group_end - group_start, 0.0);
+      for (unsigned owner = group_start; owner < group_end; ++owner) {
+        auto &cand = candidates[owner - group_start];
+        cand = build_cohistory_candidates(owner);
+        for (const auto &c : cand) {
+          if (c.scored && c.score > max_scores[owner - group_start]) max_scores[owner - group_start] = c.score;
+        }
+      }
+
+      std::unordered_set<unsigned> group_selected;
+      bool made_progress = true;
+      while (made_progress) {
+        made_progress = false;
+        for (unsigned owner = group_start; owner < group_end; ++owner) {
+          auto &page = _partition[owner];
+          if (page.size() == C) continue;
+          auto &cand = candidates[owner - group_start];
+          const double max_score = max_scores[owner - group_start];
+
+          int best_idx = -1;
+          int raw_best_idx = -1;
+          for (unsigned i = 0; i < cand.size(); ++i) {
+            unsigned s = cand[i].id;
+            if (std::find(page.begin(), page.end(), s) != page.end()) continue;
+            if (replica_limit_ > 0 && s != owner && replica_count[s] >= replica_limit_) {
+              replica_limit_skipped_count_++;
+              continue;
+            }
+
+            auto better_raw = [&](int lhs, int rhs) {
+              if (rhs < 0) return true;
+              const auto &a = cand[lhs];
+              const auto &b = cand[rhs];
+              if (a.scored != b.scored) return a.scored;
+              if (a.scored && b.scored && a.score != b.score) return a.score > b.score;
+              return a.random_rank < b.random_rank;
+            };
+            if (better_raw(static_cast<int>(i), raw_best_idx)) raw_best_idx = static_cast<int>(i);
+
+            auto effective_score = [&](const CohistoryCandidate &c) {
+              if (!c.scored) return -std::numeric_limits<double>::infinity();
+              double score = c.score;
+              if (group_selected.find(c.id) != group_selected.end()) {
+                score -= cohistory_dup_penalty_ * max_score;
+              }
+              return score;
+            };
+            auto better = [&](int lhs, int rhs) {
+              if (rhs < 0) return true;
+              const auto &a = cand[lhs];
+              const auto &b = cand[rhs];
+              if (a.scored != b.scored) return a.scored;
+              if (a.scored && b.scored) {
+                double as = effective_score(a);
+                double bs = effective_score(b);
+                if (as != bs) return as > bs;
+              }
+              bool ad = group_selected.find(a.id) != group_selected.end();
+              bool bd = group_selected.find(b.id) != group_selected.end();
+              if (ad != bd) return !ad;
+              return a.random_rank < b.random_rank;
+            };
+            if (better(static_cast<int>(i), best_idx)) best_idx = static_cast<int>(i);
+          }
+
+          if (best_idx < 0) continue;
+          unsigned chosen = cand[best_idx].id;
+          bool duplicate = group_selected.find(chosen) != group_selected.end();
+          if (duplicate) cohistory_duplicate_count_++;
+          if (raw_best_idx >= 0 && group_selected.find(cand[raw_best_idx].id) != group_selected.end() &&
+              group_selected.find(chosen) == group_selected.end()) {
+            cohistory_avoided_duplicate_count_++;
+          }
+          page.push_back(chosen);
+          if (replica_limit_ > 0 && chosen != owner) replica_count[chosen]++;
+          group_selected.insert(chosen);
+          made_progress = true;
+        }
+      }
+
+      cohistory_unique_packed_total_ += group_selected.size();
+      cohistory_group_count_++;
+    }
+  }
+
   // graph partition (light version)
   // use random permutation to select neighbors by default
   void light_graph_replicated_partition(int scale_factor) {
@@ -899,52 +1032,56 @@ class graph_partitioner {
       }
     } else {
       std::vector<unsigned> replica_count(_nd, 0);
-      for (unsigned pid = 0; pid < _nd; pid++) {
-        std::vector<_u32> c_nbrs;
-        c_nbrs.reserve(64);
-        const unsigned owner = pid;
-        for (int i = 0; i < _partition[pid].size(); i++) {
-          for (unsigned s : full_graph[_partition[pid][i]]) {
-            c_nbrs.emplace_back(s);
-          }
-          if (packing_policy_ == "history") {
-            auto score_it = transition_scores_.find(owner);
-            std::stable_sort(c_nbrs.begin(), c_nbrs.end(),
-              [&](const _u32 left, const _u32 right) {
-                bool left_scored = false, right_scored = false;
-                double left_score = 0, right_score = 0;
-                if (score_it != transition_scores_.end()) {
-                  auto lit = score_it->second.find(left);
-                  auto rit = score_it->second.find(right);
-                  left_scored = lit != score_it->second.end();
-                  right_scored = rit != score_it->second.end();
-                  if (left_scored) left_score = lit->second;
-                  if (right_scored) right_score = rit->second;
-                }
-                if (left_scored != right_scored) return left_scored;
-                if (left_scored && right_scored && left_score != right_score) return left_score > right_score;
-                return false;
-              });
-          } else {
-            auto rng = std::default_random_engine{};
-            std::shuffle(c_nbrs.begin(), c_nbrs.end(), rng);
-          }
-          for (int j = 0; j < c_nbrs.size(); j++) {
+      if (packing_policy_ == "cohistory") {
+        cohistory_graph_replicated_partition(replica_count);
+      } else {
+        for (unsigned pid = 0; pid < _nd; pid++) {
+          std::vector<_u32> c_nbrs;
+          c_nbrs.reserve(64);
+          const unsigned owner = pid;
+          for (int i = 0; i < _partition[pid].size(); i++) {
+            for (unsigned s : full_graph[_partition[pid][i]]) {
+              c_nbrs.emplace_back(s);
+            }
+            if (packing_policy_ == "history") {
+              auto score_it = transition_scores_.find(owner);
+              std::stable_sort(c_nbrs.begin(), c_nbrs.end(),
+                [&](const _u32 left, const _u32 right) {
+                  bool left_scored = false, right_scored = false;
+                  double left_score = 0, right_score = 0;
+                  if (score_it != transition_scores_.end()) {
+                    auto lit = score_it->second.find(left);
+                    auto rit = score_it->second.find(right);
+                    left_scored = lit != score_it->second.end();
+                    right_scored = rit != score_it->second.end();
+                    if (left_scored) left_score = lit->second;
+                    if (right_scored) right_score = rit->second;
+                  }
+                  if (left_scored != right_scored) return left_scored;
+                  if (left_scored && right_scored && left_score != right_score) return left_score > right_score;
+                  return false;
+                });
+            } else {
+              auto rng = std::default_random_engine{};
+              std::shuffle(c_nbrs.begin(), c_nbrs.end(), rng);
+            }
+            for (int j = 0; j < c_nbrs.size(); j++) {
+              if (_partition[pid].size() == C) {
+                break;
+              }
+              unsigned s = c_nbrs[j];
+              if (replica_limit_ > 0 && s != owner && replica_count[s] >= replica_limit_) {
+                replica_limit_skipped_count_++;
+                continue;
+              }
+              _partition[pid].push_back(s);
+              if (replica_limit_ > 0 && s != owner) {
+                replica_count[s]++;
+              }
+            }
             if (_partition[pid].size() == C) {
               break;
             }
-            unsigned s = c_nbrs[j];
-            if (replica_limit_ > 0 && s != owner && replica_count[s] >= replica_limit_) {
-              replica_limit_skipped_count_++;
-              continue;
-            }
-            _partition[pid].push_back(s);
-            if (replica_limit_ > 0 && s != owner) {
-              replica_count[s]++;
-            }
-          }
-          if (_partition[pid].size() == C) {
-            break;
           }
         }
       }
@@ -1011,6 +1148,15 @@ class graph_partitioner {
     std::cout << "packing_policy: " << packing_policy_ << std::endl;
     std::cout << "transition_score_file: " << transition_score_file_ << std::endl;
     std::cout << "replica_limit: " << replica_limit_ << std::endl;
+    if (packing_policy_ == "cohistory") {
+      double avg_group_unique = cohistory_group_count_ == 0 ? 0.0 :
+        static_cast<double>(cohistory_unique_packed_total_) / static_cast<double>(cohistory_group_count_);
+      std::cout << "cohistory_window: " << cohistory_window_ << std::endl;
+      std::cout << "cohistory_dup_penalty: " << cohistory_dup_penalty_ << std::endl;
+      std::cout << "avg unique packed adjacency per cooperative group: " << avg_group_unique << std::endl;
+      std::cout << "duplicate packed adjacency count inside cooperative groups: " << cohistory_duplicate_count_ << std::endl;
+      std::cout << "avoided duplicate count: " << cohistory_avoided_duplicate_count_ << std::endl;
+    }
     std::cout << "avg packed adjacency per node: " << avg_packed << std::endl;
     std::cout << "history scored nodes: " << history_scored_nodes_ << std::endl;
     std::cout << "replica limit skipped count: " << replica_limit_skipped_count_ << std::endl;
@@ -1062,8 +1208,14 @@ class graph_partitioner {
   std::string packing_policy_;
   std::string transition_score_file_;
   unsigned replica_limit_ = 0;
+  unsigned cohistory_window_ = 2;
+  double cohistory_dup_penalty_ = 0.1;
   unsigned long long replica_limit_skipped_count_ = 0;
   unsigned long long history_scored_nodes_ = 0;
+  unsigned long long cohistory_duplicate_count_ = 0;
+  unsigned long long cohistory_avoided_duplicate_count_ = 0;
+  unsigned long long cohistory_unique_packed_total_ = 0;
+  unsigned long long cohistory_group_count_ = 0;
   std::unordered_map<unsigned, std::unordered_map<unsigned, double>> transition_scores_;
 
   _u64 DISKANN_SECTOR_LEN;

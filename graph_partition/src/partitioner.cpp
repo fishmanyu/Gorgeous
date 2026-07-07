@@ -15,7 +15,8 @@
 int main(int argc, char **argv) {
   namespace po = boost::program_options;
   std::string index_file, data_type, gp_file, freq_file, packing_policy, transition_score_file;
-  unsigned block_size, ldg_times, lock_nums, thead_nums, cut, scale_factor, mode, replica_limit;
+  unsigned block_size, ldg_times, lock_nums, thead_nums, cut, scale_factor, mode, replica_limit, cohistory_window;
+  double cohistory_dup_penalty;
   bool use_disk, visual, dist_replace_freq;
   unsigned in_sector_len, out_sector_len;
 
@@ -51,6 +52,10 @@ int main(int argc, char **argv) {
                        "transition score file: src_id dst_id score");
     desc.add_options()("replica_limit", po::value<unsigned>(&replica_limit)->default_value(0),
                        "max times an adjacency list can be copied to other nodes pages; 0 disables the limit");
+    desc.add_options()("cohistory_window", po::value<unsigned>(&cohistory_window)->default_value(2),
+                       "cooperative history packing group size");
+    desc.add_options()("cohistory_dup_penalty", po::value<double>(&cohistory_dup_penalty)->default_value(0.1),
+                       "duplicate penalty as a fraction of owner max history score");
 
     po::variables_map vm;
     po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -70,12 +75,12 @@ int main(int argc, char **argv) {
     std::cerr << "packing_policy=distance is unsupported." << std::endl;
     return 1;
   }
-  if (packing_policy != "random" && packing_policy != "history") {
+  if (packing_policy != "random" && packing_policy != "history" && packing_policy != "cohistory") {
     std::cerr << "unsupported packing_policy: " << packing_policy << std::endl;
     return 1;
   }
-  if (packing_policy == "history" && transition_score_file.empty()) {
-    std::cerr << "transition_score_file is required when packing_policy=history." << std::endl;
+  if ((packing_policy == "history" || packing_policy == "cohistory") && transition_score_file.empty()) {
+    std::cerr << "transition_score_file is required when packing_policy=" << packing_policy << "." << std::endl;
     return 1;
   }
   GP::Mode m = GP::Mode::ALL;
@@ -92,7 +97,8 @@ int main(int argc, char **argv) {
 
   GP::graph_partitioner partitioner(index_file.c_str(), data_type.c_str(), use_disk, block_size, visual,
                                     freq_file, cut, dist_replace_freq, m, in_sector_len, out_sector_len,
-                                    packing_policy, transition_score_file, replica_limit);
+                                    packing_policy, transition_score_file, replica_limit,
+                                    cohistory_window, cohistory_dup_penalty);
   partitioner.graph_partition(gp_file.c_str(), ldg_times, scale_factor, lock_nums);
   return 0;
 }
