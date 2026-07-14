@@ -30,7 +30,8 @@ namespace diskann {
         std::shared_ptr<FileIOManager> &fio_manager,
         diskann::Metric                     metric = diskann::Metric::L2,
         bool use_graph_rep_index = false,
-        _u64 gr_sector_len = 4096);
+        _u64 gr_sector_len = 4096,
+        bool enable_region_layout = false);
     DISKANN_DLLEXPORT ~DecoIndex();
 
     // load id to page id and graph partition layout
@@ -171,6 +172,7 @@ namespace diskann {
 
     // page search
     bool use_graph_rep_index_;
+    bool enable_region_layout_ = false;
 
     bool collect_transition_trace_ = false;
     std::string transition_trace_file_ = "logs/search_trace.csv";

@@ -14,10 +14,10 @@
 
 int main(int argc, char **argv) {
   namespace po = boost::program_options;
-  std::string index_file, data_type, gp_file, freq_file, packing_policy, transition_score_file;
+  std::string index_file, data_type, gp_file, freq_file, packing_policy, transition_score_file, region_file, packing_summary_file;
   unsigned block_size, ldg_times, lock_nums, thead_nums, cut, scale_factor, mode, replica_limit, cohistory_window;
   double cohistory_dup_penalty;
-  bool use_disk, visual, dist_replace_freq;
+  bool use_disk, visual, dist_replace_freq, enable_region_layout;
   unsigned in_sector_len, out_sector_len;
 
   po::options_description desc{"Arguments"};
@@ -56,6 +56,12 @@ int main(int argc, char **argv) {
                        "cooperative history packing group size");
     desc.add_options()("cohistory_dup_penalty", po::value<double>(&cohistory_dup_penalty)->default_value(0.1),
                        "duplicate penalty as a fraction of owner max history score");
+    desc.add_options()("region_file", po::value<std::string>(&region_file)->default_value(""),
+                       "regions.tsv for packing_policy=region_history");
+    desc.add_options()("packing_summary_file", po::value<std::string>(&packing_summary_file)->default_value("packing_summary.csv"),
+                       "CSV summary path for packing_policy=region_history");
+    desc.add_options()("enable_region_layout", po::value<bool>(&enable_region_layout)->default_value(false),
+                       "write graph-replicated pages in region order when packing_policy=region_history");
 
     po::variables_map vm;
     po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -75,12 +81,16 @@ int main(int argc, char **argv) {
     std::cerr << "packing_policy=distance is unsupported." << std::endl;
     return 1;
   }
-  if (packing_policy != "random" && packing_policy != "history" && packing_policy != "cohistory") {
+  if (packing_policy != "random" && packing_policy != "history" && packing_policy != "cohistory" && packing_policy != "region_history") {
     std::cerr << "unsupported packing_policy: " << packing_policy << std::endl;
     return 1;
   }
-  if ((packing_policy == "history" || packing_policy == "cohistory") && transition_score_file.empty()) {
+  if ((packing_policy == "history" || packing_policy == "cohistory" || packing_policy == "region_history") && transition_score_file.empty()) {
     std::cerr << "transition_score_file is required when packing_policy=" << packing_policy << "." << std::endl;
+    return 1;
+  }
+  if (packing_policy == "region_history" && region_file.empty()) {
+    std::cerr << "region_file is required when packing_policy=region_history." << std::endl;
     return 1;
   }
   GP::Mode m = GP::Mode::ALL;
@@ -98,7 +108,8 @@ int main(int argc, char **argv) {
   GP::graph_partitioner partitioner(index_file.c_str(), data_type.c_str(), use_disk, block_size, visual,
                                     freq_file, cut, dist_replace_freq, m, in_sector_len, out_sector_len,
                                     packing_policy, transition_score_file, replica_limit,
-                                    cohistory_window, cohistory_dup_penalty);
+                                    cohistory_window, cohistory_dup_penalty,
+                                    region_file, packing_summary_file, enable_region_layout);
   partitioner.graph_partition(gp_file.c_str(), ldg_times, scale_factor, lock_nums);
   return 0;
 }

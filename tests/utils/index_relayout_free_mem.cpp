@@ -133,7 +133,8 @@ void load_disk_index(const char *index_name, _u64 DISKANN_SECTOR_LEN, std::vecto
 // The new index data
   template <typename T>
 void relayout(const char* indexname, const char* partition_name, const int mode,
-              _u64 diskann_sector_len = 4096, _u64 out_sector_len = 4096) {
+              _u64 diskann_sector_len = 4096, _u64 out_sector_len = 4096,
+              bool enable_region_layout = false) {
   _u64                               C;
   _u64                               _partition_nums;
   _u64                               _nd;
@@ -186,7 +187,7 @@ void relayout(const char* indexname, const char* partition_name, const int mode,
   auto _dim = meta_pair.second[1];
   max_node_len = meta_pair.second[3];
   unsigned nnodes_per_sector = meta_pair.second[4];
-  auto diskann_partition_number = ROUND_UP(_nd, C) / C;
+  auto diskann_partition_number = ROUND_UP(_nd, nnodes_per_sector) / nnodes_per_sector;
   if (mode == DEFAULT_MODE && DISKANN_SECTOR_LEN / max_node_len != C) {
     diskann::cout << "nnodes per sector: " << DISKANN_SECTOR_LEN / max_node_len << " C: " << C
                   << std::endl;
@@ -263,6 +264,24 @@ void relayout(const char* indexname, const char* partition_name, const int mode,
   std::cout << "max_node_len: " << max_node_len << "graph_node_len: " \
             << graph_node_len << ", emb_node_len: " << emb_node_len << std::endl;
 
+  std::unique_ptr<char[]> region_owner_embeddings;
+  if (mode == GRAPH_REPLICA && enable_region_layout) {
+    std::cout << "Loading owner embeddings sequentially for region layout." << std::endl;
+    region_owner_embeddings = std::make_unique<char[]>(_nd * emb_node_len);
+    std::ifstream emb_reader(indexname, std::ios::binary);
+    emb_reader.seekg(DISKANN_SECTOR_LEN, std::ios::beg);
+    std::unique_ptr<char[]> input_sector = std::make_unique<char[]>(DISKANN_SECTOR_LEN);
+    for (_u64 sector_id = 0; sector_id < diskann_partition_number; sector_id++) {
+      emb_reader.read(input_sector.get(), DISKANN_SECTOR_LEN);
+      for (unsigned j = 0; j < nnodes_per_sector; j++) {
+        _u64 node_id = sector_id * nnodes_per_sector + j;
+        if (node_id >= _nd) break;
+        memcpy(region_owner_embeddings.get() + node_id * emb_node_len,
+               input_sector.get() + j * max_node_len, emb_node_len);
+      }
+    }
+  }
+
   if (mode == GRAPH_ONLY) {
     for (unsigned i = 0; i < _partition_nums; i++) {
       // write the embedding data first
@@ -296,11 +315,15 @@ void relayout(const char* indexname, const char* partition_name, const int mode,
       std::cout << "partition number not equals to layout size." << std::endl;
       exit(-1);
     }
-    for (unsigned i = 0; i < _partition_nums; i++) {
-      if (i != layout[i][0]) {
-        std::cout << "layout " << i << " not match with partition " << layout[i][0] << std::endl;
-        exit(-1);
+    if (!enable_region_layout) {
+      for (unsigned i = 0; i < _partition_nums; i++) {
+        if (i != layout[i][0]) {
+          std::cout << "layout " << i << " not match with partition " << layout[i][0] << std::endl;
+          exit(-1);
+        }
       }
+    } else {
+      std::cout << "enable_region_layout: write graph-replicated pages in partition order." << std::endl;
     }
 
     // process size
@@ -317,18 +340,21 @@ void relayout(const char* indexname, const char* partition_name, const int mode,
       std::cout << cur_batch_size << " " << cur_read_block << " " << cur_start << " " << loaded << std::endl;
 
       size_t bytesToRead = cur_read_block * DISKANN_SECTOR_LEN;
-      buffer = nullptr;
-      if (posix_memalign(reinterpret_cast<void**>(&buffer), 4096, bytesToRead) != 0) {
-        std::cerr << "Error allocating aligned memory." << std::endl;
-        close(fd);
-        return;
-      }
-      std::unique_ptr<char[]> mem_index(buffer);
-      bytesRead = read(fd, mem_index.get(), bytesToRead);
-      if (bytesRead == -1) {
-        std::cerr << "Error reading file." << std::endl;
-        close(fd);
-        return;
+      std::unique_ptr<char[]> mem_index;
+      if (!enable_region_layout) {
+        buffer = nullptr;
+        if (posix_memalign(reinterpret_cast<void**>(&buffer), 4096, bytesToRead) != 0) {
+          std::cerr << "Error allocating aligned memory." << std::endl;
+          close(fd);
+          return;
+        }
+        mem_index.reset(buffer);
+        bytesRead = read(fd, mem_index.get(), bytesToRead);
+        if (bytesRead == -1) {
+          std::cerr << "Error reading file." << std::endl;
+          close(fd);
+          return;
+        }
       }
 
       diskann::cout << "relayout has done " << (float) cur_start / _partition_nums
@@ -339,10 +365,16 @@ void relayout(const char* indexname, const char* partition_name, const int mode,
         // write the embedding data first
         memset(sector_buf.get(), 0, OUTPUT_SECTOR_LEN);
         uint64_t start_offset = 0;
-        uint64_t index_offset = ((_u64) (i - cur_start) / nnodes_per_sector) * DISKANN_SECTOR_LEN 
-                                + ((_u64) (i - cur_start) % nnodes_per_sector) * max_node_len;
-        memcpy((char*) sector_buf.get(),
-              (char*) mem_index.get() + index_offset, emb_node_len);
+        const unsigned owner_id = layout[i][0];
+        if (enable_region_layout) {
+          memcpy((char*) sector_buf.get(),
+                region_owner_embeddings.get() + static_cast<_u64>(owner_id) * emb_node_len, emb_node_len);
+        } else {
+          uint64_t index_offset = ((_u64) (i - cur_start) / nnodes_per_sector) * DISKANN_SECTOR_LEN 
+                                  + ((_u64) (i - cur_start) % nnodes_per_sector) * max_node_len;
+          memcpy((char*) sector_buf.get(),
+                (char*) mem_index.get() + index_offset, emb_node_len);
+        }
         start_offset += emb_node_len;
         // copy layout data
         unsigned layout_size = layout[i].size();
@@ -383,6 +415,7 @@ int main(int argc, char** argv) {
   int mode = std::stoi(argv[4]);
   int in_sector_len = std::stoi(argv[5]);
   int out_sector_len = std::stoi(argv[6]);
+  bool enable_region_layout = argc > 7 ? std::stoi(argv[7]) != 0 : false;
 
   if (mode == DEFAULT_MODE) {
     std::cout << "relayout all." << std::endl;
@@ -398,9 +431,9 @@ int main(int argc, char** argv) {
   }
 
   if (std::string(data_type) == std::string("uint8")) {
-    relayout<uint8_t>(indexName, partitonName, mode, in_sector_len, out_sector_len);
+    relayout<uint8_t>(indexName, partitonName, mode, in_sector_len, out_sector_len, enable_region_layout);
   } else if (std::string(data_type) == std::string("float")) {
-    relayout<float>(indexName, partitonName, mode, in_sector_len, out_sector_len);
+    relayout<float>(indexName, partitonName, mode, in_sector_len, out_sector_len, enable_region_layout);
   } else {
     std::cout << "not support type" << std::endl;
     exit(-1);

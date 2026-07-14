@@ -3,6 +3,7 @@
 #include <cstring>
 #include "logger.h"
 #include "percentile_stats.h"
+#include "replica_redundancy_stats.h"
 #include "deco_index.h"
 #include "timer.h"
 
@@ -102,6 +103,9 @@ namespace diskann {
         _u64* indices = indices_vec.data() + (task_id * k_search);
         float* distances = distances_vec.data() + (task_id * k_search);
         QueryStats* stats = stats_ptr + task_id;
+#ifdef ENABLE_REPLICA_REDUNDANCY_STATS
+        ReplicaRedundancyTracker replica_redundancy_tracker;
+#endif
         const bool collect_trace = collect_transition_trace_;
         std::vector<TransitionTraceRow> trace_rows;
         tsl::robin_set<_u32> trace_expanded;
@@ -143,6 +147,10 @@ namespace diskann {
         full_retset.reserve(4096);
 
         // lambda to batch compute query<-> node distances in PQ space
+        auto graph_page_id = [this](const unsigned id) -> unsigned {
+          return enable_region_layout_ ? id2page_[id] : id;
+        };
+
         auto compute_pq_dists = [this, pq_coord_scratch, pq_dists](const unsigned *ids,
                                                                 const _u64 n_ids,
                                                                 float *dists_out) {
@@ -319,6 +327,18 @@ namespace diskann {
             char *node_buf = sector_buf + emb_node_len + sizeof(unsigned) * (1 + n_gc_node_per_sector);
             unsigned *p_layout = (unsigned*)(sector_buf + emb_node_len);
             unsigned p_size = *(p_layout++);
+#ifdef ENABLE_REPLICA_REDUNDANCY_STATS
+            std::vector<uint32_t> replica_adjacency_ids;
+            if (p_size > 1) {
+              replica_adjacency_ids.reserve(p_size - 1);
+            }
+            for (unsigned j = 1; j < p_size; j++) {
+              replica_adjacency_ids.push_back(static_cast<uint32_t>(p_layout[j]));
+            }
+            replica_redundancy_tracker.record_page(
+                static_cast<uint32_t>(fn->pid), static_cast<uint32_t>(exact_id),
+                replica_adjacency_ids);
+#endif
             for (unsigned j = 1; j < p_size; j++) {
               if (node_in_mem_pos(p_layout[j]) == INF) {
                 char *nnbr_buf = node_buf + j * graph_node_len;
@@ -407,9 +427,10 @@ namespace diskann {
                   num_seen++;
                   n_cached_in_q++;
                 } else {
-                  if (page_visited.insert(id).second) {
+                  const unsigned pid = graph_page_id(id);
+                  if (page_visited.insert(pid).second) {
                     num_seen++;
-                    auto fn = std::make_shared<FrontierNode>(id, id, gc_index_fid);
+                    auto fn = std::make_shared<FrontierNode>(id, pid, gc_index_fid);
                     frontier.push_back(fn);
                   }
                 }
@@ -459,7 +480,7 @@ namespace diskann {
           // page visited don't need to be clear.
           tsl::robin_map<char*, unsigned> sec_buf2pid;
           for (_u32 ord_idx = l_idx; l_idx - ord_idx < MAX_N_SECTOR_READS && l_idx < embedding_search_L; l_idx++) {
-            auto pid = retset[l_idx].id;  // for graph-replicated layout, pid is id
+            auto pid = graph_page_id(retset[l_idx].id);
             if (page_visited.find(pid) == page_visited.end()) {
               char* cached_emb_buf = get_mem_emb_addr(retset[l_idx].id);
               if (cached_emb_buf != nullptr) {
@@ -494,7 +515,8 @@ namespace diskann {
             for (int i = 0; i < n_read_blks; i++) {
               auto sector_buf = tmp_bufs[i];
               auto pid = sec_buf2pid[sector_buf];
-              compute_exact_dists_and_push(sector_buf, pid);
+              unsigned exact_id = enable_region_layout_ && !gp_layout_[pid].empty() ? gp_layout_[pid][0] : pid;
+              compute_exact_dists_and_push(sector_buf, exact_id);
             }
           }
         }
@@ -539,6 +561,29 @@ namespace diskann {
         if (stats != nullptr) {
           stats->total_us = (double) query_timer.elapsed();
           stats->postprocess_us = (double) part_timer.elapsed();
+#ifdef ENABLE_REPLICA_REDUNDANCY_STATS
+          const auto &replica_counters = replica_redundancy_tracker.counters();
+          stats->replica_graph_page_ios = replica_counters.graph_page_ios;
+          stats->replica_first_read_pages = replica_counters.first_read_pages;
+          stats->replica_repeated_page_reads = replica_counters.repeated_page_reads;
+          stats->replica_attempts = replica_counters.replica_attempts;
+          stats->replica_attempts_on_first_read_pages = replica_counters.replica_attempts_on_first_read_pages;
+          stats->unique_replica_adjacencies = replica_counters.unique_replica_adjacencies;
+          stats->all_replica_duplicates = replica_counters.all_replica_duplicates;
+          stats->cross_page_replica_duplicates = replica_counters.cross_page_replica_duplicates;
+          stats->replica_to_replica_duplicates = replica_counters.replica_to_replica_duplicates;
+          stats->owner_to_replica_duplicates = replica_counters.owner_to_replica_duplicates;
+          stats->pages_with_any_replica_duplicate = replica_counters.pages_with_any_replica_duplicate;
+          stats->fully_redundant_replica_pages = replica_counters.fully_redundant_replica_pages;
+          stats->replica_redundancy = replica_counters.replica_attempts_on_first_read_pages == 0
+                                         ? 0.0
+                                         : static_cast<double>(replica_counters.replica_to_replica_duplicates) /
+                                               static_cast<double>(replica_counters.replica_attempts_on_first_read_pages);
+          stats->duplicate_replicas_per_graph_io = replica_counters.graph_page_ios == 0
+                                                   ? 0.0
+                                                   : static_cast<double>(replica_counters.replica_to_replica_duplicates) /
+                                                         static_cast<double>(replica_counters.graph_page_ios);
+#endif
         }
         if (collect_trace && !trace_rows.empty()) {
           std::lock_guard<std::mutex> lock(transition_trace_mutex_);

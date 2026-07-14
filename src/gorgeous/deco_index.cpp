@@ -35,8 +35,9 @@ namespace diskann {
   template<typename T>
   DecoIndex<T>::DecoIndex(std::shared_ptr<FileIOManager> &IOManager,
                                 diskann::Metric m, bool use_graph_rep_index,
-                                _u64 gr_sector_len)
-      : io_manager(IOManager), metric(m), use_graph_rep_index_(use_graph_rep_index) {
+                                _u64 gr_sector_len, bool enable_region_layout)
+      : io_manager(IOManager), metric(m), use_graph_rep_index_(use_graph_rep_index),
+        enable_region_layout_(enable_region_layout) {
     if (m == diskann::Metric::COSINE || m == diskann::Metric::INNER_PRODUCT) {
       if (std::is_floating_point<T>::value) {
         diskann::cout << "Cosine metric chosen for (normalized) float data."
@@ -212,7 +213,7 @@ namespace diskann {
       tsl::robin_map<char*, unsigned> sec_buf2id;
       for (_u32 id = st; id < ed; id++) {
         if (use_graph_rep_index_) {
-          pid = id;
+          pid = enable_region_layout_ ? id2page_[id] : id;
         } else {
           pid = id2page_[id];
         }
@@ -482,6 +483,7 @@ namespace diskann {
     }
 
     std::cout << "use_graph_rep_index: " << use_graph_rep_index_ << std::endl;
+    std::cout << "enable_region_layout: " << enable_region_layout_ << std::endl;
 
     this->max_nthreads = num_threads;
     this->setup_thread_data(num_threads);
@@ -535,6 +537,17 @@ namespace diskann {
       part.read((char *) id2page_.data(), sizeof(unsigned) * nd);
     } else if (mode == GRAPH_CACHE_INDEX) {
       this->n_gc_node_per_sector = C;
+      if (enable_region_layout_) {
+        this->gp_layout_.resize(partition_nums);
+        for (unsigned i = 0; i < partition_nums; i++) {
+          unsigned s;
+          part.read((char *) &s, sizeof(unsigned));
+          this->gp_layout_[i].resize(s);
+          part.read((char *) gp_layout_[i].data(), sizeof(unsigned) * s);
+        }
+        this->id2page_.resize(nd);
+        part.read((char *) id2page_.data(), sizeof(unsigned) * nd);
+      }
     } else if (mode == GRAPH_METADATA_ONLY) {
       this->n_graph_node_per_sector = C;
     } else if (mode == GRAPH_ONLY) {

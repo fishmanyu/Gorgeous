@@ -37,6 +37,23 @@ namespace diskann {
     unsigned n_ext_cmps = 0;    // # exact cmps
     unsigned n_cache_hits = 0;  // # cache_hits
     unsigned n_hops = 0;        // # search hops
+
+#ifdef ENABLE_REPLICA_REDUNDANCY_STATS
+    uint64_t replica_graph_page_ios = 0;
+    uint64_t replica_first_read_pages = 0;
+    uint64_t replica_repeated_page_reads = 0;
+    uint64_t replica_attempts = 0;
+    uint64_t replica_attempts_on_first_read_pages = 0;
+    uint64_t unique_replica_adjacencies = 0;
+    uint64_t all_replica_duplicates = 0;
+    uint64_t cross_page_replica_duplicates = 0;
+    uint64_t replica_to_replica_duplicates = 0;
+    uint64_t owner_to_replica_duplicates = 0;
+    uint64_t pages_with_any_replica_duplicate = 0;
+    uint64_t fully_redundant_replica_pages = 0;
+    double replica_redundancy = 0.0;
+    double duplicate_replicas_per_graph_io = 0.0;
+#endif
   };
 
   template<typename T>

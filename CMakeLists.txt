@@ -19,6 +19,11 @@ project(diskann)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+option(ENABLE_REPLICA_REDUNDANCY_STATS "Collect per-query replica redundancy statistics" OFF)
+if(ENABLE_REPLICA_REDUNDANCY_STATS)
+    add_compile_definitions(ENABLE_REPLICA_REDUNDANCY_STATS)
+endif()
+
 add_subdirectory(graph_partition)
 
 if(MSVC)

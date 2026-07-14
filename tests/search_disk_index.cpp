@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <omp.h>
 #include <pq_flash_index.h>
@@ -67,6 +68,7 @@ int search_disk_index(
     const float pq_ratio=0.9,
     const bool deco_impl = false,
     const bool use_graph_rep_index = false,
+    const bool enable_region_layout = false,
     const float mem_graph_use_ratio = 1.0,
     const float mem_emb_use_ratio = 1.0,
     const float emb_search_ratio = 1.0,
@@ -114,7 +116,7 @@ int search_disk_index(
   int res;
   if (deco_impl) {
     fio_reader.reset(new FileIOManager());
-    _decoIndex = std::make_shared<diskann::DecoIndex<T>>(fio_reader, metric, use_graph_rep_index, sector_len);
+    _decoIndex = std::make_shared<diskann::DecoIndex<T>>(fio_reader, metric, use_graph_rep_index, sector_len, enable_region_layout);
     res = _decoIndex->load(num_threads, index_path_prefix.c_str(), pq_path_prefix.c_str(),
                            disk_file_path, graph_rep_index_prefix, disk_graph_prefix);
   }  else {
@@ -345,6 +347,89 @@ int search_disk_index(
       diskann::cout << std::setw(10) << recall << std::endl;
     } else
       diskann::cout << std::endl;
+
+#ifdef ENABLE_REPLICA_REDUNDANCY_STATS
+    mkdir("logs", 0755);
+    const std::string replica_csv_path = "logs/replica_redundancy_stats.csv";
+    std::ofstream replica_csv(replica_csv_path,
+                              test_id == 0 ? std::ios::out : std::ios::app);
+    if (test_id == 0) {
+      replica_csv << "query_id,L,graph_page_ios,first_read_pages,repeated_page_reads,"
+                  << "replica_attempts,replica_attempts_on_first_read_pages,"
+                  << "unique_replica_adjacencies,all_replica_duplicates,"
+                  << "cross_page_replica_duplicates,replica_to_replica_duplicates,"
+                  << "owner_to_replica_duplicates,pages_with_any_replica_duplicate,"
+                  << "fully_redundant_replica_pages,replica_redundancy,duplicate_replicas_per_graph_io,cross_page_replica_redundancy,cross_page_duplicates_per_graph_io\n";
+    }
+
+    uint64_t total_graph_page_ios = 0;
+    uint64_t total_first_read_pages = 0;
+    uint64_t total_replica_attempts_on_first_read_pages = 0;
+    uint64_t total_cross_page_replica_duplicates = 0;
+    uint64_t total_replica_to_replica_duplicates = 0;
+    uint64_t total_fully_redundant_replica_pages = 0;
+    const uint64_t stats_begin = std::min<uint64_t>(warmup_cnt, query_num);
+
+    for (uint64_t q = 0; q < query_num; q++) {
+      const auto &st = stats[q];
+      replica_csv << q << "," << L << ","
+                  << st.replica_graph_page_ios << ","
+                  << st.replica_first_read_pages << ","
+                  << st.replica_repeated_page_reads << ","
+                  << st.replica_attempts << ","
+                  << st.replica_attempts_on_first_read_pages << ","
+                  << st.unique_replica_adjacencies << ","
+                  << st.all_replica_duplicates << ","
+                  << st.cross_page_replica_duplicates << ","
+                  << st.replica_to_replica_duplicates << ","
+                  << st.owner_to_replica_duplicates << ","
+                  << st.pages_with_any_replica_duplicate << ","
+                  << st.fully_redundant_replica_pages << ","
+                  << st.replica_redundancy << ","
+                  << st.duplicate_replicas_per_graph_io << ","
+                  << (st.replica_attempts_on_first_read_pages == 0 ? 0.0 : static_cast<double>(st.cross_page_replica_duplicates) / static_cast<double>(st.replica_attempts_on_first_read_pages)) << ","
+                  << (st.replica_graph_page_ios == 0 ? 0.0 : static_cast<double>(st.cross_page_replica_duplicates) / static_cast<double>(st.replica_graph_page_ios)) << "\n";
+
+      if (q >= stats_begin) {
+        total_graph_page_ios += st.replica_graph_page_ios;
+        total_first_read_pages += st.replica_first_read_pages;
+        total_replica_attempts_on_first_read_pages +=
+            st.replica_attempts_on_first_read_pages;
+        total_cross_page_replica_duplicates +=
+            st.cross_page_replica_duplicates;
+        total_replica_to_replica_duplicates +=
+            st.replica_to_replica_duplicates;
+        total_fully_redundant_replica_pages +=
+            st.fully_redundant_replica_pages;
+      }
+    }
+
+    auto safe_div = [](uint64_t num, uint64_t den) -> double {
+      return den == 0 ? 0.0 : static_cast<double>(num) / static_cast<double>(den);
+    };
+    const double replica_duplicate_rate =
+        safe_div(total_replica_to_replica_duplicates,
+                 total_replica_attempts_on_first_read_pages);
+    const double cross_page_duplicate_rate =
+        safe_div(total_cross_page_replica_duplicates,
+                 total_replica_attempts_on_first_read_pages);
+    const double duplicates_per_graph_io =
+        safe_div(total_replica_to_replica_duplicates, total_graph_page_ios);
+    const double effective_replica_utilization = 1.0 - replica_duplicate_rate;
+    const double fully_redundant_page_rate =
+        safe_div(total_fully_redundant_replica_pages, total_first_read_pages);
+
+    diskann::cout << "Replica redundancy stats L=" << L
+                  << " csv=" << replica_csv_path
+                  << " replica_duplicate_rate=" << replica_duplicate_rate
+                  << " cross_page_duplicate_rate=" << cross_page_duplicate_rate
+                  << " duplicates_per_graph_io=" << duplicates_per_graph_io
+                  << " effective_replica_utilization="
+                  << effective_replica_utilization
+                  << " fully_redundant_page_rate="
+                  << fully_redundant_page_rate << std::endl;
+#endif
+
     delete[] stats;
   }
 
@@ -383,6 +468,7 @@ int main(int argc, char** argv) {
   float                 pq_ratio = 1.0;
   bool deco_impl = false;
   bool use_graph_rep_index = false;
+  bool enable_region_layout = false;
   bool collect_transition_trace = false;
   float mem_graph_use_ratio = 0.0;
   float mem_emb_use_ratio = 0.0;
@@ -459,6 +545,8 @@ int main(int argc, char** argv) {
                        "The percentage of how many vectors in a page to search each time");
     desc.add_options()("use_graph_rep_index", po::value<bool>(&use_graph_rep_index)->default_value(0),
                        "whether use graph cache index");
+    desc.add_options()("enable_region_layout", po::value<bool>(&enable_region_layout)->default_value(0),
+                       "use owner node to physical page mapping for region-ordered graph-replicated index");
     desc.add_options()("collect_transition_trace", po::value<bool>(&collect_transition_trace)->default_value(0),
                        "whether collect graph traversal trace to logs/search_trace.csv");
     desc.add_options()("mem_graph_use_ratio", po::value<float>(&mem_graph_use_ratio)->default_value(1.0f),
@@ -530,21 +618,21 @@ int main(int argc, char** argv) {
           query_file, gt_file, disk_file_path, disk_graph_prefix, graph_rep_index_prefix,
           num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec, mem_L, sector_len,
           use_page_search, use_ratio, pq_ratio, deco_impl,
-          use_graph_rep_index, mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace);
+          use_graph_rep_index, enable_region_layout, mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace);
     else if (data_type == std::string("int8"))
       return search_disk_index<int8_t>(
           metric, index_path_prefix, pq_path_prefix, mem_index_path, mem_sample_path, result_path_prefix,
           query_file, gt_file, disk_file_path, disk_graph_prefix, graph_rep_index_prefix,
           num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec, mem_L, sector_len,
           use_page_search, use_ratio, pq_ratio, deco_impl,
-          use_graph_rep_index, mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace);
+          use_graph_rep_index, enable_region_layout, mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace);
     else if (data_type == std::string("uint8"))
       return search_disk_index<uint8_t>(
           metric, index_path_prefix, pq_path_prefix, mem_index_path, mem_sample_path, result_path_prefix,
           query_file, gt_file, disk_file_path, disk_graph_prefix, graph_rep_index_prefix,
           num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec, mem_L, sector_len,
           use_page_search, use_ratio, pq_ratio, deco_impl,
-          use_graph_rep_index, mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace);
+          use_graph_rep_index, enable_region_layout, mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace);
     else {
       std::cerr << "Unsupported data type. Use float or int8 or uint8"
                 << std::endl;
