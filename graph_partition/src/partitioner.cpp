@@ -17,7 +17,7 @@ int main(int argc, char **argv) {
   std::string index_file, data_type, gp_file, freq_file, packing_policy, transition_score_file, region_file, packing_summary_file;
   unsigned block_size, ldg_times, lock_nums, thead_nums, cut, scale_factor, mode, replica_limit, cohistory_window;
   double cohistory_dup_penalty;
-  bool use_disk, visual, dist_replace_freq, enable_region_layout;
+  bool use_disk, visual, dist_replace_freq, enable_region_layout, enable_region_replica_dedup, enable_region_physical_reorder;
   unsigned in_sector_len, out_sector_len;
 
   po::options_description desc{"Arguments"};
@@ -61,7 +61,11 @@ int main(int argc, char **argv) {
     desc.add_options()("packing_summary_file", po::value<std::string>(&packing_summary_file)->default_value("packing_summary.csv"),
                        "CSV summary path for packing_policy=region_history");
     desc.add_options()("enable_region_layout", po::value<bool>(&enable_region_layout)->default_value(false),
-                       "write graph-replicated pages in region order when packing_policy=region_history");
+                       "deprecated alias for enable_region_physical_reorder");
+    desc.add_options()("enable_region_replica_dedup", po::value<bool>(&enable_region_replica_dedup)->default_value(false),
+                       "use Region-aware Replica Packing while preserving history candidate generation");
+    desc.add_options()("enable_region_physical_reorder", po::value<bool>(&enable_region_physical_reorder)->default_value(false),
+                       "write graph-replicated pages in regions.tsv order");
 
     po::variables_map vm;
     po::store(po::parse_command_line(argc, argv, desc), vm);
@@ -89,8 +93,8 @@ int main(int argc, char **argv) {
     std::cerr << "transition_score_file is required when packing_policy=" << packing_policy << "." << std::endl;
     return 1;
   }
-  if (packing_policy == "region_history" && region_file.empty()) {
-    std::cerr << "region_file is required when packing_policy=region_history." << std::endl;
+  if ((packing_policy == "region_history" || enable_region_replica_dedup || enable_region_physical_reorder || enable_region_layout) && region_file.empty()) {
+    std::cerr << "region_file is required when a region feature is enabled." << std::endl;
     return 1;
   }
   GP::Mode m = GP::Mode::ALL;
@@ -109,7 +113,8 @@ int main(int argc, char **argv) {
                                     freq_file, cut, dist_replace_freq, m, in_sector_len, out_sector_len,
                                     packing_policy, transition_score_file, replica_limit,
                                     cohistory_window, cohistory_dup_penalty,
-                                    region_file, packing_summary_file, enable_region_layout);
+                                    region_file, packing_summary_file, enable_region_layout,
+                                    enable_region_replica_dedup, enable_region_physical_reorder);
   partitioner.graph_partition(gp_file.c_str(), ldg_times, scale_factor, lock_nums);
   return 0;
 }

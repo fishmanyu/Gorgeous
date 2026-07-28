@@ -95,6 +95,25 @@ namespace diskann {
     return avg / (len - warmup);
   }
 
+  template<typename T>
+  inline T get_percentile_stats(
+      QueryStats *stats, uint64_t len, uint64_t warmup, float percentile,
+      const std::function<T(const QueryStats &)> &member_fn) {
+    uint64_t n = len > warmup ? len - warmup : 0;
+    if (n == 0) return T();
+    std::vector<T> vals(n);
+    for (uint64_t i = warmup; i < len; i++) {
+      vals[i - warmup] = member_fn(stats[i]);
+    }
+    std::sort(vals.begin(), vals.end(),
+              [](const T &left, const T &right) { return left < right; });
+    uint64_t idx = static_cast<uint64_t>(percentile * n);
+    if (idx >= n) idx = n - 1;
+    auto retval = vals[idx];
+    vals.clear();
+    return retval;
+  }
+
   // The following two functions are used when getting statistics while range searching on only queries with
   // non-zero gt lengths
   template<typename T>

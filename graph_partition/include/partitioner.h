@@ -121,7 +121,9 @@ class graph_partitioner {
                     double cohistory_dup_penalty = 0.1,
                     std::string region_file = std::string(""),
                     std::string packing_summary_file = std::string(""),
-                    bool enable_region_layout = false) {
+                    bool enable_region_layout = false,
+                    bool enable_region_replica_dedup = false,
+                    bool enable_region_physical_reorder = false) {
     _visual = visual;
     mode_ = mode;
     packing_policy_ = packing_policy;
@@ -131,7 +133,8 @@ class graph_partitioner {
     cohistory_dup_penalty_ = cohistory_dup_penalty;
     region_file_ = region_file;
     packing_summary_file_ = packing_summary_file;
-    enable_region_layout_ = enable_region_layout;
+    enable_region_replica_dedup_ = enable_region_replica_dedup || packing_policy_ == "region_history";
+    enable_region_physical_reorder_ = enable_region_physical_reorder || enable_region_layout;
     this->DISKANN_SECTOR_LEN = diskann_sector_len;
     this->OUTPUT_SECTOR_LEN = out_sector_len;
 
@@ -169,9 +172,10 @@ class graph_partitioner {
     if (packing_policy_ == "history" || packing_policy_ == "cohistory" || packing_policy_ == "region_history") {
       load_transition_scores();
     }
-    if (packing_policy_ == "region_history") {
+    if (enable_region_replica_dedup_ || enable_region_physical_reorder_) {
       load_regions();
     }
+    print_region_config_summary();
     cursize = _nd / 1000;
 
     if (!freq_file.empty()) {
@@ -415,7 +419,7 @@ class graph_partitioner {
    * @param partition
    */
   void save_partition(const char *filename) {
-    if (enable_region_layout_ && mode_ == Mode::GRAPH_REPLICA) {
+    if (enable_region_physical_reorder_ && mode_ == Mode::GRAPH_REPLICA) {
       apply_region_physical_layout();
     }
     // re_id2pid();
@@ -497,7 +501,7 @@ class graph_partitioner {
 
   void load_regions() {
     if (region_file_.empty()) {
-      std::cout << "region_file is required when packing_policy=region_history." << std::endl;
+      std::cout << "region_file is required when a region feature is enabled." << std::endl;
       exit(-1);
     }
     if (!fs::exists(region_file_)) {
@@ -534,6 +538,97 @@ class graph_partitioner {
       if (!region.empty()) regions_.push_back(region);
     }
     std::cout << "loaded " << regions_.size() << " regions from " << region_file_ << std::endl;
+  }
+
+  void print_region_config_summary() const {
+    std::cout << "Region ablation config:" << std::endl;
+    std::cout << "  replica_dedup: " << (enable_region_replica_dedup_ ? "enabled" : "disabled") << std::endl;
+    std::cout << "  physical_reorder: " << (enable_region_physical_reorder_ ? "enabled" : "disabled") << std::endl;
+    std::cout << "  region_file: " << ((enable_region_replica_dedup_ || enable_region_physical_reorder_) ? region_file_ : std::string("<unused>")) << std::endl;
+    std::cout << "  mapping: " << (enable_region_physical_reorder_ ? "enabled" : "disabled") << std::endl;
+  }
+
+  uint64_t fnv1a_mix(uint64_t h, uint64_t v) const {
+    h ^= v;
+    h *= 1099511628211ULL;
+    return h;
+  }
+
+  uint64_t owner_replica_layout_hash() const {
+    std::vector<std::pair<unsigned, const std::vector<unsigned>*>> pages;
+    pages.reserve(_partition.size());
+    for (const auto &page : _partition) {
+      if (!page.empty()) pages.push_back({page[0], &page});
+    }
+    std::sort(pages.begin(), pages.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
+    uint64_t h = 1469598103934665603ULL;
+    for (const auto &entry : pages) {
+      h = fnv1a_mix(h, entry.first);
+      const auto &page = *entry.second;
+      h = fnv1a_mix(h, page.size());
+      for (unsigned i = 1; i < page.size(); i++) h = fnv1a_mix(h, page[i]);
+    }
+    return h;
+  }
+
+  uint64_t node_to_page_mapping_hash() const {
+    uint64_t h = 1469598103934665603ULL;
+    std::vector<unsigned> owner_to_page(_nd, INF);
+    for (unsigned pid = 0; pid < _partition.size(); pid++) {
+      if (!_partition[pid].empty()) owner_to_page[_partition[pid][0]] = pid;
+    }
+    for (unsigned id = 0; id < owner_to_page.size(); id++) {
+      h = fnv1a_mix(h, owner_to_page[id]);
+    }
+    return h;
+  }
+
+  void write_packing_summary() {
+    if (packing_summary_file_.empty()) return;
+    std::ofstream writer(packing_summary_file_);
+    if (!writer) {
+      std::cout << "Cannot write packing_summary_file: " << packing_summary_file_ << std::endl;
+      return;
+    }
+    unsigned long long filled_slots = 0;
+    unsigned long long duplicate_slots = 0;
+    for (const auto &page : _partition) {
+      std::unordered_set<unsigned> seen;
+      for (unsigned i = 1; i < page.size(); i++) {
+        filled_slots++;
+        if (!seen.insert(page[i]).second) duplicate_slots++;
+      }
+    }
+    unsigned long long total_slots = region_total_slots_;
+    if (total_slots == 0) {
+      for (const auto &page : _partition) {
+        if (page.size() < C) total_slots += C - page.size();
+        total_slots += page.size() > 0 ? page.size() - 1 : 0;
+      }
+    }
+    double before = total_slots == 0 ? 0.0 :
+      static_cast<double>(region_duplicates_before_) / static_cast<double>(total_slots);
+    double after = total_slots == 0 ? 0.0 :
+      static_cast<double>(region_duplicates_after_) / static_cast<double>(total_slots);
+    writer << "packing_policy,replica_dedup,physical_reorder,region_file,total_slots,filled_slots,page_duplicate_slots,"
+           << "duplicate_candidates_skipped,replacement_selected,fallback_duplicates,transition_score_loss,"
+           << "Region_redundancy_before,Region_redundancy_after,owner_replica_hash,node_to_page_hash\n";
+    writer << packing_policy_ << ","
+           << (enable_region_replica_dedup_ ? 1 : 0) << ","
+           << (enable_region_physical_reorder_ ? 1 : 0) << ","
+           << ((enable_region_replica_dedup_ || enable_region_physical_reorder_) ? region_file_ : std::string("")) << ","
+           << total_slots << ","
+           << filled_slots << ","
+           << duplicate_slots << ","
+           << region_duplicate_candidates_skipped_ << ","
+           << region_replacement_selected_ << ","
+           << region_fallback_duplicates_ << ","
+           << region_transition_score_loss_ << ","
+           << before << ","
+           << after << ","
+           << owner_replica_layout_hash() << ","
+           << node_to_page_mapping_hash() << "\n";
   }
 
   void re_id2pid() {
@@ -1015,27 +1110,6 @@ class graph_partitioner {
     return true;
   }
 
-  void write_region_packing_summary() {
-    if (packing_summary_file_.empty()) return;
-    std::ofstream writer(packing_summary_file_);
-    if (!writer) {
-      std::cout << "Cannot write packing_summary_file: " << packing_summary_file_ << std::endl;
-      return;
-    }
-    double before = region_total_slots_ == 0 ? 0.0 :
-      static_cast<double>(region_duplicates_before_) / static_cast<double>(region_total_slots_);
-    double after = region_total_slots_ == 0 ? 0.0 :
-      static_cast<double>(region_duplicates_after_) / static_cast<double>(region_total_slots_);
-    writer << "total_slots,duplicate_candidates_skipped,replacement_selected,fallback_duplicates,transition_score_loss,Region_redundancy_before,Region_redundancy_after\n";
-    writer << region_total_slots_ << ","
-           << region_duplicate_candidates_skipped_ << ","
-           << region_replacement_selected_ << ","
-           << region_fallback_duplicates_ << ","
-           << region_transition_score_loss_ << ","
-           << before << ","
-           << after << "\n";
-  }
-
   void region_history_pack_one_page(unsigned owner,
                                     std::unordered_set<unsigned> &selected_replica_set,
                                     std::unordered_set<unsigned> &baseline_selected_set,
@@ -1132,7 +1206,7 @@ class graph_partitioner {
       std::unordered_set<unsigned> baseline_selected_set;
       region_history_pack_one_page(owner, selected_replica_set, baseline_selected_set, replica_count);
     }
-    write_region_packing_summary();
+    write_packing_summary();
   }
 
   void cohistory_graph_replicated_partition(std::vector<unsigned> &replica_count) {
@@ -1283,7 +1357,8 @@ class graph_partitioner {
       std::vector<unsigned> replica_count(_nd, 0);
       if (packing_policy_ == "cohistory") {
         cohistory_graph_replicated_partition(replica_count);
-      } else if (packing_policy_ == "region_history") {
+        write_packing_summary();
+      } else if (enable_region_replica_dedup_) {
         region_history_graph_replicated_partition(replica_count);
       } else {
         for (unsigned pid = 0; pid < _nd; pid++) {
@@ -1335,6 +1410,9 @@ class graph_partitioner {
             }
           }
         }
+      }
+      if (!enable_region_replica_dedup_ && packing_policy_ != "cohistory") {
+        write_packing_summary();
       }
     }
 
@@ -1399,9 +1477,11 @@ class graph_partitioner {
     std::cout << "packing_policy: " << packing_policy_ << std::endl;
     std::cout << "transition_score_file: " << transition_score_file_ << std::endl;
     std::cout << "replica_limit: " << replica_limit_ << std::endl;
-    if (packing_policy_ == "region_history") {
+    if (enable_region_replica_dedup_ || enable_region_physical_reorder_) {
       std::cout << "region_file: " << region_file_ << std::endl;
       std::cout << "packing_summary_file: " << packing_summary_file_ << std::endl;
+      std::cout << "region replica dedup: " << (enable_region_replica_dedup_ ? "enabled" : "disabled") << std::endl;
+      std::cout << "region physical reorder: " << (enable_region_physical_reorder_ ? "enabled" : "disabled") << std::endl;
       std::cout << "region duplicate candidates skipped: " << region_duplicate_candidates_skipped_ << std::endl;
       std::cout << "region replacement selected: " << region_replacement_selected_ << std::endl;
       std::cout << "region fallback duplicates: " << region_fallback_duplicates_ << std::endl;
@@ -1473,7 +1553,8 @@ class graph_partitioner {
   std::string packing_summary_file_;
   std::vector<std::vector<unsigned>> regions_;
   std::vector<bool> region_page_seen_;
-  bool enable_region_layout_ = false;
+  bool enable_region_replica_dedup_ = false;
+  bool enable_region_physical_reorder_ = false;
   unsigned long long replica_limit_skipped_count_ = 0;
   unsigned long long history_scored_nodes_ = 0;
   unsigned long long cohistory_duplicate_count_ = 0;

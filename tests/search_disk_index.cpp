@@ -173,6 +173,9 @@ int search_disk_index(
                 << std::setw(4) << "BW"
                 << std::setw(9) << "QPS"
                 << std::setw(9) << "Mean Ltc"
+                << std::setw(9) << "P50"
+                << std::setw(9) << "P95"
+                << std::setw(9) << "P99"
                 << std::setw(9) << "999 Ltc" 
                 << std::setw(9) << "Graph IO"
                 << std::setw(9) << "Emb IO"
@@ -271,8 +274,20 @@ int search_disk_index(
         stats, query_num, warmup_cnt,
         [](const diskann::QueryStats& stats) { return stats.total_us; }));
 
+    int latency_p50 = (int)(diskann::get_percentile_stats<float>(
+        stats, query_num, warmup_cnt, 0.50,
+        [](const diskann::QueryStats& stats) { return stats.total_us; }));
+
+    int latency_p95 = (int)(diskann::get_percentile_stats<float>(
+        stats, query_num, warmup_cnt, 0.95,
+        [](const diskann::QueryStats& stats) { return stats.total_us; }));
+
+    int latency_p99 = (int)(diskann::get_percentile_stats<float>(
+        stats, query_num, warmup_cnt, 0.99,
+        [](const diskann::QueryStats& stats) { return stats.total_us; }));
+
     int latency_999 = (int)(diskann::get_percentile_stats<float>(
-        stats, query_num, 0.999,
+        stats, query_num, warmup_cnt, 0.999,
         [](const diskann::QueryStats& stats) { return stats.total_us; }));
 
     auto mean_ios = diskann::get_mean_stats<unsigned>(
@@ -330,6 +345,9 @@ int search_disk_index(
                   << std::setw(4) << beamwidth
                   << std::setw(9) << qps
                   << std::setw(9) << mean_latency
+                  << std::setw(9) << latency_p50
+                  << std::setw(9) << latency_p95
+                  << std::setw(9) << latency_p99
                   << std::setw(9) << latency_999
                   << std::setw(9) << mean_ios
                   << std::setw(9) << mean_emb_ios
@@ -367,6 +385,7 @@ int search_disk_index(
     uint64_t total_replica_attempts_on_first_read_pages = 0;
     uint64_t total_cross_page_replica_duplicates = 0;
     uint64_t total_replica_to_replica_duplicates = 0;
+    uint64_t total_pages_with_any_replica_duplicate = 0;
     uint64_t total_fully_redundant_replica_pages = 0;
     const uint64_t stats_begin = std::min<uint64_t>(warmup_cnt, query_num);
 
@@ -399,6 +418,8 @@ int search_disk_index(
             st.cross_page_replica_duplicates;
         total_replica_to_replica_duplicates +=
             st.replica_to_replica_duplicates;
+        total_pages_with_any_replica_duplicate +=
+            st.pages_with_any_replica_duplicate;
         total_fully_redundant_replica_pages +=
             st.fully_redundant_replica_pages;
       }
@@ -416,6 +437,8 @@ int search_disk_index(
     const double duplicates_per_graph_io =
         safe_div(total_replica_to_replica_duplicates, total_graph_page_ios);
     const double effective_replica_utilization = 1.0 - replica_duplicate_rate;
+    const double pages_with_any_duplicate_rate =
+        safe_div(total_pages_with_any_replica_duplicate, total_first_read_pages);
     const double fully_redundant_page_rate =
         safe_div(total_fully_redundant_replica_pages, total_first_read_pages);
 
@@ -424,6 +447,8 @@ int search_disk_index(
                   << " replica_duplicate_rate=" << replica_duplicate_rate
                   << " cross_page_duplicate_rate=" << cross_page_duplicate_rate
                   << " duplicates_per_graph_io=" << duplicates_per_graph_io
+                  << " pages_with_any_duplicate_rate="
+                  << pages_with_any_duplicate_rate
                   << " effective_replica_utilization="
                   << effective_replica_utilization
                   << " fully_redundant_page_rate="
@@ -469,6 +494,7 @@ int main(int argc, char** argv) {
   bool deco_impl = false;
   bool use_graph_rep_index = false;
   bool enable_region_layout = false;
+  bool enable_region_physical_reorder = false;
   bool collect_transition_trace = false;
   float mem_graph_use_ratio = 0.0;
   float mem_emb_use_ratio = 0.0;
@@ -546,6 +572,8 @@ int main(int argc, char** argv) {
     desc.add_options()("use_graph_rep_index", po::value<bool>(&use_graph_rep_index)->default_value(0),
                        "whether use graph cache index");
     desc.add_options()("enable_region_layout", po::value<bool>(&enable_region_layout)->default_value(0),
+                       "deprecated alias for enable_region_physical_reorder");
+    desc.add_options()("enable_region_physical_reorder", po::value<bool>(&enable_region_physical_reorder)->default_value(0),
                        "use owner node to physical page mapping for region-ordered graph-replicated index");
     desc.add_options()("collect_transition_trace", po::value<bool>(&collect_transition_trace)->default_value(0),
                        "whether collect graph traversal trace to logs/search_trace.csv");
@@ -618,21 +646,21 @@ int main(int argc, char** argv) {
           query_file, gt_file, disk_file_path, disk_graph_prefix, graph_rep_index_prefix,
           num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec, mem_L, sector_len,
           use_page_search, use_ratio, pq_ratio, deco_impl,
-          use_graph_rep_index, enable_region_layout, mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace);
+          use_graph_rep_index, (enable_region_layout || enable_region_physical_reorder), mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace);
     else if (data_type == std::string("int8"))
       return search_disk_index<int8_t>(
           metric, index_path_prefix, pq_path_prefix, mem_index_path, mem_sample_path, result_path_prefix,
           query_file, gt_file, disk_file_path, disk_graph_prefix, graph_rep_index_prefix,
           num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec, mem_L, sector_len,
           use_page_search, use_ratio, pq_ratio, deco_impl,
-          use_graph_rep_index, enable_region_layout, mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace);
+          use_graph_rep_index, (enable_region_layout || enable_region_physical_reorder), mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace);
     else if (data_type == std::string("uint8"))
       return search_disk_index<uint8_t>(
           metric, index_path_prefix, pq_path_prefix, mem_index_path, mem_sample_path, result_path_prefix,
           query_file, gt_file, disk_file_path, disk_graph_prefix, graph_rep_index_prefix,
           num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec, mem_L, sector_len,
           use_page_search, use_ratio, pq_ratio, deco_impl,
-          use_graph_rep_index, enable_region_layout, mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace);
+          use_graph_rep_index, (enable_region_layout || enable_region_physical_reorder), mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace);
     else {
       std::cerr << "Unsupported data type. Use float or int8 or uint8"
                 << std::endl;
