@@ -71,6 +71,11 @@ namespace diskann {
 
     DISKANN_DLLEXPORT void enable_transition_trace(bool enabled,
                                                    const std::string &trace_file = "logs/search_trace.csv");
+    DISKANN_DLLEXPORT void enable_trace_v2(unsigned mode,
+                                           const std::string &trace_dir = "logs");
+    DISKANN_DLLEXPORT void enable_region_io_trace(bool enabled,
+                                                  const std::string &trace_dir = "logs/region_io_trace",
+                                                  const std::string &region_file = "");
 
     std::shared_ptr<FileIOManager> &io_manager;
 
@@ -177,6 +182,15 @@ namespace diskann {
     bool collect_transition_trace_ = false;
     std::string transition_trace_file_ = "logs/search_trace.csv";
     std::mutex transition_trace_mutex_;
+
+    unsigned trace_v2_mode_ = 0;
+    std::string trace_v2_dir_ = "logs";
+    std::mutex trace_v2_mutex_;
+
+    bool collect_region_io_trace_ = false;
+    std::string region_io_trace_dir_ = "logs/region_io_trace";
+    std::mutex region_io_trace_mutex_;
+    std::vector<unsigned> region_io_owner_to_region_;
     // id2 graph partition page and gp layout.
     std::vector<unsigned> id2page_;
     std::vector<std::vector<unsigned>> gp_layout_;

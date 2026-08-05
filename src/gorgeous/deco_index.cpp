@@ -147,6 +147,76 @@ namespace diskann {
   }
 
   template<typename T>
+  void DecoIndex<T>::enable_trace_v2(unsigned mode, const std::string &trace_dir) {
+    trace_v2_mode_ = mode;
+    trace_v2_dir_ = trace_dir;
+    if (trace_v2_mode_ == 0 || trace_v2_mode_ == 1 || trace_v2_mode_ == 2 || trace_v2_mode_ == 3) {
+      return;
+    }
+    mkdir(trace_v2_dir_.c_str(), 0755);
+    std::lock_guard<std::mutex> lock(trace_v2_mutex_);
+    {
+      std::ofstream writer(trace_v2_dir_ + "/expansion_trace_v2.csv", std::ios::out);
+      writer << "query_id,expansion_event_id,expansion_order,current,arrival_parent,arrival_kind,"
+             << "current_first_insert_event,current_first_insert_order,current_distance,expansion_kind,"
+             << "triggering_page_owner,graph_io,physical_page_id,current_adjacency_source,"
+             << "current_adjacency_from_replica,retset_position_or_pop_position,query_finished_flag\n";
+    }
+    {
+      std::ofstream writer(trace_v2_dir_ + "/edge_scan_trace_v2.csv", std::ios::out);
+      writer << "query_id,expansion_event_id,adjacency_scan_id,trigger_current,adjacency_source,"
+             << "page_owner,scan_kind,neighbor,accepted,first_accepted,"
+             << "neighbor_arrival_parent_after_scan,neighbor_distance,graph_io,is_replica,physical_page_id\n";
+    }
+  }
+
+  template<typename T>
+  void DecoIndex<T>::enable_region_io_trace(bool enabled, const std::string &trace_dir,
+                                            const std::string &region_file) {
+    collect_region_io_trace_ = enabled;
+    region_io_trace_dir_ = trace_dir;
+    region_io_owner_to_region_.clear();
+    if (!collect_region_io_trace_) {
+      return;
+    }
+    mkdir(region_io_trace_dir_.c_str(), 0755);
+    if (!region_file.empty()) {
+      std::ifstream reader(region_file);
+      std::string line;
+      while (std::getline(reader, line)) {
+        if (line.empty()) continue;
+        std::istringstream iss(line);
+        unsigned region_id = INF, position = INF, page_id = INF;
+        if (!(iss >> region_id >> position >> page_id)) continue;
+        if (page_id >= region_io_owner_to_region_.size()) {
+          region_io_owner_to_region_.resize(static_cast<size_t>(page_id) + 1, INF);
+        }
+        region_io_owner_to_region_[page_id] = region_id;
+      }
+    }
+    std::lock_guard<std::mutex> lock(region_io_trace_mutex_);
+    {
+      std::ofstream writer(region_io_trace_dir_ + "/graph_io_batches.csv", std::ios::out);
+      writer << "query_id,thread_id,batch_id,batch_size,logical_owner_key,owner_min,owner_max,"
+             << "physical_min,physical_max,address_span,adjacent_gap_mean,adjacent_gap_median,"
+             << "adjacent_gap_p95,adjacent_gap_p99,contiguous_adjacent_pairs,le1_pair_ratio,"
+             << "le4_pair_ratio,le16_pair_ratio,le64_pair_ratio,same_region_pair_ratio,"
+             << "construct_us,prep_us,submit_us,submit_to_first_completion_us,"
+             << "submit_to_all_completion_us,getevents_wait_us,page_process_us,query_read_disk_us,"
+             << "query_total_us\n";
+    }
+    {
+      std::ofstream writer(region_io_trace_dir_ + "/graph_io_requests.csv", std::ios::out);
+      writer << "query_id,thread_id,batch_id,request_index,owner_node_id,physical_page_id,file_offset,region_id\n";
+    }
+    {
+      std::ofstream writer(region_io_trace_dir_ + "/query_io_summary.csv", std::ios::out);
+      writer << "query_id,thread_id,graph_io_batches,graph_io_requests,submit_us,completion_wait_us,"
+             << "page_process_us,read_disk_us,total_us\n";
+    }
+  }
+
+  template<typename T>
   void DecoIndex<T>::load_mem_index(Metric metric, const size_t query_dim, 
       const std::string& mem_index_path, const _u32 num_threads,
       const _u32 mem_L) {

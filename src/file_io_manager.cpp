@@ -6,6 +6,7 @@
 #include <cassert>
 #include <cstdio>
 #include <iostream>
+#include <chrono>
 #include "tsl/robin_map.h"
 #include "utils.h"
 #define MAX_EVENTS 1024
@@ -255,6 +256,48 @@ int FileIOManager::submit_read_reqs(std::vector<AlignedRead> &read_reqs,
   }
 
   int ret = io_submit(ctx, (int64_t) n_ops, cbs.data());
+  if (ret != n_ops) {
+    std::cerr << "io_submit() failed; returned " << ret
+              << ", expected=" << n_ops << ", ernno=" << errno << "="
+              << ::strerror(-ret);
+    std::cout << "ctx: " << ctx << "\n";
+    exit(-1);
+  }
+  return n_ops;
+}
+
+int FileIOManager::submit_read_reqs(std::vector<AlignedRead> &read_reqs,
+                                        int fid,
+                                        io_context_t &ctx, double *prep_us,
+                                        double *submit_us) {
+  if (read_reqs.size() > MAX_EVENTS) {
+    std::cerr << "The number of requests should not exceed " << MAX_EVENTS << std::endl;
+    exit(-1);
+  }
+  int n_ops = read_reqs.size();
+  std::vector<iocb_t *>    cbs(n_ops, nullptr);
+  std::vector<struct iocb> cb(n_ops);
+  auto prep_begin = std::chrono::steady_clock::now();
+  for (int j = 0; j < n_ops; j++) {
+    io_prep_pread(cb.data() + j, this->fds[fid], read_reqs[j].buf,
+                  read_reqs[j].len,
+                  read_reqs[j].offset);
+  }
+  for (int i = 0; i < n_ops; i++) {
+    cb[i].data = (void*) read_reqs[i].buf;
+    cbs[i] = cb.data() + i;
+  }
+  auto prep_end = std::chrono::steady_clock::now();
+
+  auto submit_begin = std::chrono::steady_clock::now();
+  int ret = io_submit(ctx, (int64_t) n_ops, cbs.data());
+  auto submit_end = std::chrono::steady_clock::now();
+  if (prep_us != nullptr) {
+    *prep_us = std::chrono::duration<double, std::micro>(prep_end - prep_begin).count();
+  }
+  if (submit_us != nullptr) {
+    *submit_us = std::chrono::duration<double, std::micro>(submit_end - submit_begin).count();
+  }
   if (ret != n_ops) {
     std::cerr << "io_submit() failed; returned " << ret
               << ", expected=" << n_ops << ", ernno=" << errno << "="

@@ -72,7 +72,12 @@ int search_disk_index(
     const float mem_graph_use_ratio = 1.0,
     const float mem_emb_use_ratio = 1.0,
     const float emb_search_ratio = 1.0,
-    const bool collect_transition_trace = false) {
+    const bool collect_transition_trace = false,
+    const unsigned enable_trace_v2 = 0,
+    const std::string& trace_v2_output_dir = "logs",
+    const bool enable_region_io_trace = false,
+    const std::string& region_io_trace_dir = "logs/region_io_trace",
+    const std::string& region_file = "") {
   diskann::cout << "Search parameters: #threads: " << num_threads << ", ";
   if (beamwidth <= 0)
     diskann::cout << "beamwidth to be optimized for each L value" << std::flush;
@@ -130,6 +135,8 @@ int search_disk_index(
   }
   if (deco_impl) {
     _decoIndex->enable_transition_trace(collect_transition_trace);
+    _decoIndex->enable_trace_v2(enable_trace_v2, trace_v2_output_dir);
+    _decoIndex->enable_region_io_trace(enable_region_io_trace, region_io_trace_dir, region_file);
   }
 
   // load in-memory navigation graph
@@ -496,6 +503,11 @@ int main(int argc, char** argv) {
   bool enable_region_layout = false;
   bool enable_region_physical_reorder = false;
   bool collect_transition_trace = false;
+  unsigned enable_trace_v2 = 0;
+  std::string trace_v2_output_dir = "logs";
+  bool enable_region_io_trace = false;
+  std::string region_io_trace_dir = "logs/region_io_trace";
+  std::string region_file = "";
   float mem_graph_use_ratio = 0.0;
   float mem_emb_use_ratio = 0.0;
   float emb_search_ratio = 1.0;
@@ -577,6 +589,16 @@ int main(int argc, char** argv) {
                        "use owner node to physical page mapping for region-ordered graph-replicated index");
     desc.add_options()("collect_transition_trace", po::value<bool>(&collect_transition_trace)->default_value(0),
                        "whether collect graph traversal trace to logs/search_trace.csv");
+    desc.add_options()("enable_trace_v2", po::value<unsigned>(&enable_trace_v2)->default_value(0),
+                       "whether collect semantic trace v2 for incoming-direction analysis");
+    desc.add_options()("trace_v2_output_dir", po::value<std::string>(&trace_v2_output_dir)->default_value("logs"),
+                       "directory for expansion_trace_v2.csv and edge_scan_trace_v2.csv");
+    desc.add_options()("enable_region_io_trace", po::value<bool>(&enable_region_io_trace)->default_value(0),
+                       "collect low-overhead graph I/O batch locality/timing trace");
+    desc.add_options()("region_io_trace_dir", po::value<std::string>(&region_io_trace_dir)->default_value("logs/region_io_trace"),
+                       "directory for graph I/O batch trace outputs");
+    desc.add_options()("region_file", po::value<std::string>(&region_file)->default_value(""),
+                       "optional regions.tsv for annotating graph I/O batches");
     desc.add_options()("mem_graph_use_ratio", po::value<float>(&mem_graph_use_ratio)->default_value(1.0f),
                        "ratio of using memory graph");
     desc.add_options()("mem_emb_use_ratio", po::value<float>(&mem_emb_use_ratio)->default_value(1.0f),
@@ -646,21 +668,21 @@ int main(int argc, char** argv) {
           query_file, gt_file, disk_file_path, disk_graph_prefix, graph_rep_index_prefix,
           num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec, mem_L, sector_len,
           use_page_search, use_ratio, pq_ratio, deco_impl,
-          use_graph_rep_index, (enable_region_layout || enable_region_physical_reorder), mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace);
+          use_graph_rep_index, (enable_region_layout || enable_region_physical_reorder), mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace, enable_trace_v2, trace_v2_output_dir, enable_region_io_trace, region_io_trace_dir, region_file);
     else if (data_type == std::string("int8"))
       return search_disk_index<int8_t>(
           metric, index_path_prefix, pq_path_prefix, mem_index_path, mem_sample_path, result_path_prefix,
           query_file, gt_file, disk_file_path, disk_graph_prefix, graph_rep_index_prefix,
           num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec, mem_L, sector_len,
           use_page_search, use_ratio, pq_ratio, deco_impl,
-          use_graph_rep_index, (enable_region_layout || enable_region_physical_reorder), mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace);
+          use_graph_rep_index, (enable_region_layout || enable_region_physical_reorder), mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace, enable_trace_v2, trace_v2_output_dir, enable_region_io_trace, region_io_trace_dir, region_file);
     else if (data_type == std::string("uint8"))
       return search_disk_index<uint8_t>(
           metric, index_path_prefix, pq_path_prefix, mem_index_path, mem_sample_path, result_path_prefix,
           query_file, gt_file, disk_file_path, disk_graph_prefix, graph_rep_index_prefix,
           num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec, mem_L, sector_len,
           use_page_search, use_ratio, pq_ratio, deco_impl,
-          use_graph_rep_index, (enable_region_layout || enable_region_physical_reorder), mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace);
+          use_graph_rep_index, (enable_region_layout || enable_region_physical_reorder), mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace, enable_trace_v2, trace_v2_output_dir, enable_region_io_trace, region_io_trace_dir, region_file);
     else {
       std::cerr << "Unsupported data type. Use float or int8 or uint8"
                 << std::endl;

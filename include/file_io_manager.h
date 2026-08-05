@@ -40,6 +40,9 @@ class FileIOManager {
                           std::vector<int> &fids, IOContext& ctx);
   int submit_read_reqs(std::vector<AlignedRead>& read_reqs, 
                           int fid, IOContext& ctx);
+  int submit_read_reqs(std::vector<AlignedRead>& read_reqs,
+                          int fid, IOContext& ctx, double *prep_us,
+                          double *submit_us);
   int submit_write_reqs(std::vector<AlignedWrite>& write_reqs, 
                           std::vector<int> &fids, IOContext& ctx);
   void get_events(IOContext &ctx, int n_ops);
