@@ -77,7 +77,17 @@ int search_disk_index(
     const std::string& trace_v2_output_dir = "logs",
     const bool enable_region_io_trace = false,
     const std::string& region_io_trace_dir = "logs/region_io_trace",
-    const std::string& region_file = "") {
+    const std::string& region_file = "",
+    const bool enable_global_qd_control = false,
+    const unsigned global_qd_cap = 0,
+    const bool qd_control_trace = false,
+    const bool enable_region_prefetch = false,
+    const unsigned region_prefetch_size = 4,
+    const std::string& region_buffer_policy = "query_lifetime",
+    const uint64_t region_cache_limit_bytes_per_query = 16ULL * 1024ULL * 1024ULL,
+    const std::string& region_cache_overflow_policy = "abort",
+    const std::string& region_prefetch_stats_file = "",
+    const bool deterministic_logical_page_processing = false) {
   diskann::cout << "Search parameters: #threads: " << num_threads << ", ";
   if (beamwidth <= 0)
     diskann::cout << "beamwidth to be optimized for each L value" << std::flush;
@@ -137,6 +147,11 @@ int search_disk_index(
     _decoIndex->enable_transition_trace(collect_transition_trace);
     _decoIndex->enable_trace_v2(enable_trace_v2, trace_v2_output_dir);
     _decoIndex->enable_region_io_trace(enable_region_io_trace, region_io_trace_dir, region_file);
+    _decoIndex->configure_region_prefetch(enable_region_prefetch, region_file, region_prefetch_size,
+                                          region_cache_limit_bytes_per_query, region_buffer_policy,
+                                          region_cache_overflow_policy);
+    _decoIndex->configure_global_qd_control(enable_global_qd_control, global_qd_cap, qd_control_trace);
+    _decoIndex->configure_deterministic_logical_page_processing(deterministic_logical_page_processing);
   }
 
   // load in-memory navigation graph
@@ -275,7 +290,7 @@ int search_disk_index(
                                                query_result_ids[test_id].data(),
                                                query_num, recall_at);
 
-    uint64_t warmup_cnt = 20;
+    uint64_t warmup_cnt = query_num > 20 ? 20 : 0;
 
     int mean_latency = (int)(diskann::get_mean_stats<float>(
         stats, query_num, warmup_cnt,
@@ -372,6 +387,72 @@ int search_disk_index(
       diskann::cout << std::setw(10) << recall << std::endl;
     } else
       diskann::cout << std::endl;
+
+    if (!region_prefetch_stats_file.empty()) {
+      const bool append = test_id > 0;
+      std::ofstream pf(region_prefetch_stats_file, append ? std::ios::app : std::ios::out);
+      if (!append) {
+        pf << "query_id,L,region_prefetch_enabled,overflow,logical_graph_ios,device_read_submits,"
+           << "device_read_bytes,device_4kb_reads,device_16kb_reads,region_first_triggers,"
+           << "region_cache_hits,loaded_regions,additional_pages_read,additional_pages_used,"
+           << "unused_additional_pages,duplicate_load_attempts,same_region_pending_frontier_count,"
+           << "pending_waiter_registered_count,pending_waiter_processed_count,pending_waiter_duplicate_count,"
+           << "requested_page_parse_count,prefetched_only_page_parse_count,pending_region_leftover_at_query_end,"
+           << "waiter_registered_but_not_processed,duplicate_region_submission_count,"
+           << "duplicate_logical_page_process_count,region_slice_byte_mismatch_count,"
+           << "cache_entries_released_at_query_end,cache_leftover_after_cleanup,"
+           << "cache_peak_bytes,cache_allocations,"
+           << "cache_frees,region_lookup_us,region_cache_manage_us,"
+           << "deterministic_enabled,det_logical_page_requests,det_seq_assigned,det_ready,"
+           << "det_processed,det_duplicate_requests,det_duplicate_processes,det_queue_inserts,"
+           << "det_queue_max_depth,det_queue_leftover,det_requested_but_not_processed,"
+           << "det_processed_without_request,det_physical_io_submissions,det_logical_to_physical_coalescing,"
+           << "total_us,read_disk_us,disk_proc_us,GraphIO,EmbIO\n";
+      }
+      for (size_t qi = 0; qi < query_num; qi++) {
+        const auto &st = stats[qi];
+        pf << qi << "," << L << "," << st.region_prefetch_enabled << ","
+           << st.region_prefetch_overflow << "," << st.region_logical_graph_ios << ","
+           << st.region_device_read_submits << "," << st.region_device_read_bytes << ","
+           << st.region_device_4kb_reads << "," << st.region_device_16kb_reads << ","
+           << st.region_first_triggers << "," << st.region_cache_hits << ","
+           << st.region_loaded_regions << "," << st.region_additional_pages_read << ","
+           << st.region_additional_pages_used << "," << st.region_unused_additional_pages << ","
+           << st.region_duplicate_load_attempts << ","
+           << st.region_same_region_pending_frontier_count << ","
+           << st.region_pending_waiter_registered_count << ","
+           << st.region_pending_waiter_processed_count << ","
+           << st.region_pending_waiter_duplicate_count << ","
+           << st.region_requested_page_parse_count << ","
+           << st.region_prefetched_only_page_parse_count << ","
+           << st.region_pending_region_leftover_at_query_end << ","
+           << st.region_waiter_registered_but_not_processed << ","
+           << st.region_duplicate_region_submission_count << ","
+           << st.region_duplicate_logical_page_process_count << ","
+           << st.region_slice_byte_mismatch_count << ","
+           << st.region_cache_entries_released_at_query_end << ","
+           << st.region_cache_leftover_after_cleanup << ","
+           << st.region_cache_peak_bytes << ","
+           << st.region_cache_allocations << "," << st.region_cache_frees << ","
+           << st.region_lookup_us << "," << st.region_cache_manage_us << ","
+           << st.deterministic_logical_page_processing_enabled << ","
+           << st.deterministic_logical_page_request_count << ","
+           << st.deterministic_logical_request_seq_assigned_count << ","
+           << st.deterministic_logical_page_ready_count << ","
+           << st.deterministic_logical_page_processed_count << ","
+           << st.deterministic_logical_page_duplicate_request_count << ","
+           << st.deterministic_logical_page_duplicate_process_count << ","
+           << st.deterministic_queue_insert_count << ","
+           << st.deterministic_queue_max_depth << ","
+           << st.deterministic_queue_leftover_at_query_end << ","
+           << st.deterministic_requested_but_not_processed_count << ","
+           << st.deterministic_processed_without_request_count << ","
+           << st.deterministic_physical_io_submission_count << ","
+           << st.deterministic_logical_to_physical_coalescing_count << ","
+           << st.total_us << "," << st.read_disk_us << "," << st.disk_proc_us << ","
+           << st.n_ios << "," << st.n_emb_ios << "\n";
+      }
+    }
 
 #ifdef ENABLE_REPLICA_REDUNDANCY_STATS
     mkdir("logs", 0755);
@@ -485,6 +566,8 @@ int search_disk_index(
   }
 
   diskann::aligned_free(query);
+  delete[] gt_ids;
+  delete[] gt_dists;
   return 0;
 }
 
@@ -508,6 +591,16 @@ int main(int argc, char** argv) {
   bool enable_region_io_trace = false;
   std::string region_io_trace_dir = "logs/region_io_trace";
   std::string region_file = "";
+  bool enable_global_qd_control = false;
+  unsigned global_qd_cap = 0;
+  bool qd_control_trace = false;
+  bool enable_region_prefetch = false;
+  unsigned region_prefetch_size = 4;
+  std::string region_buffer_policy = "query_lifetime";
+  uint64_t region_cache_limit_bytes_per_query = 16ULL * 1024ULL * 1024ULL;
+  std::string region_cache_overflow_policy = "abort";
+  std::string region_prefetch_stats_file = "";
+  bool deterministic_logical_page_processing = false;
   float mem_graph_use_ratio = 0.0;
   float mem_emb_use_ratio = 0.0;
   float emb_search_ratio = 1.0;
@@ -599,6 +692,26 @@ int main(int argc, char** argv) {
                        "directory for graph I/O batch trace outputs");
     desc.add_options()("region_file", po::value<std::string>(&region_file)->default_value(""),
                        "optional regions.tsv for annotating graph I/O batches");
+    desc.add_options()("enable_global_qd_control", po::value<bool>(&enable_global_qd_control)->default_value(0),
+                       "enable experimental process-wide graph-read request QD controller");
+    desc.add_options()("global_qd_cap", po::value<unsigned>(&global_qd_cap)->default_value(0),
+                       "process-wide graph-read request cap for QD controller");
+    desc.add_options()("qd_control_trace", po::value<bool>(&qd_control_trace)->default_value(0),
+                       "record QD controller wait/split counters in region I/O trace");
+    desc.add_options()("enable_region_prefetch", po::value<bool>(&enable_region_prefetch)->default_value(0),
+                       "enable query-lifetime R=4 online Region prefetch prototype");
+    desc.add_options()("region_prefetch_size", po::value<unsigned>(&region_prefetch_size)->default_value(4),
+                       "Region prefetch size in 4KB pages; task 3A supports 4");
+    desc.add_options()("region_buffer_policy", po::value<std::string>(&region_buffer_policy)->default_value("query_lifetime"),
+                       "Region buffer lifetime policy; task 3A supports query_lifetime");
+    desc.add_options()("region_cache_limit_bytes", po::value<uint64_t>(&region_cache_limit_bytes_per_query)->default_value(16ULL * 1024ULL * 1024ULL),
+                       "per-query Region cache safety limit in bytes");
+    desc.add_options()("region_cache_overflow_policy", po::value<std::string>(&region_cache_overflow_policy)->default_value("abort"),
+                       "Region cache overflow policy; task 3A supports abort");
+    desc.add_options()("region_prefetch_stats_file", po::value<std::string>(&region_prefetch_stats_file)->default_value(""),
+                       "optional per-query Region prefetch stats CSV");
+    desc.add_options()("deterministic_logical_page_processing", po::value<bool>(&deterministic_logical_page_processing)->default_value(0),
+                       "process completed graph pages in stable logical request order; default off");
     desc.add_options()("mem_graph_use_ratio", po::value<float>(&mem_graph_use_ratio)->default_value(1.0f),
                        "ratio of using memory graph");
     desc.add_options()("mem_emb_use_ratio", po::value<float>(&mem_emb_use_ratio)->default_value(1.0f),
@@ -668,21 +781,21 @@ int main(int argc, char** argv) {
           query_file, gt_file, disk_file_path, disk_graph_prefix, graph_rep_index_prefix,
           num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec, mem_L, sector_len,
           use_page_search, use_ratio, pq_ratio, deco_impl,
-          use_graph_rep_index, (enable_region_layout || enable_region_physical_reorder), mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace, enable_trace_v2, trace_v2_output_dir, enable_region_io_trace, region_io_trace_dir, region_file);
+          use_graph_rep_index, (enable_region_layout || enable_region_physical_reorder), mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace, enable_trace_v2, trace_v2_output_dir, enable_region_io_trace, region_io_trace_dir, region_file, enable_global_qd_control, global_qd_cap, qd_control_trace, enable_region_prefetch, region_prefetch_size, region_buffer_policy, region_cache_limit_bytes_per_query, region_cache_overflow_policy, region_prefetch_stats_file, deterministic_logical_page_processing);
     else if (data_type == std::string("int8"))
       return search_disk_index<int8_t>(
           metric, index_path_prefix, pq_path_prefix, mem_index_path, mem_sample_path, result_path_prefix,
           query_file, gt_file, disk_file_path, disk_graph_prefix, graph_rep_index_prefix,
           num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec, mem_L, sector_len,
           use_page_search, use_ratio, pq_ratio, deco_impl,
-          use_graph_rep_index, (enable_region_layout || enable_region_physical_reorder), mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace, enable_trace_v2, trace_v2_output_dir, enable_region_io_trace, region_io_trace_dir, region_file);
+          use_graph_rep_index, (enable_region_layout || enable_region_physical_reorder), mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace, enable_trace_v2, trace_v2_output_dir, enable_region_io_trace, region_io_trace_dir, region_file, enable_global_qd_control, global_qd_cap, qd_control_trace, enable_region_prefetch, region_prefetch_size, region_buffer_policy, region_cache_limit_bytes_per_query, region_cache_overflow_policy, region_prefetch_stats_file, deterministic_logical_page_processing);
     else if (data_type == std::string("uint8"))
       return search_disk_index<uint8_t>(
           metric, index_path_prefix, pq_path_prefix, mem_index_path, mem_sample_path, result_path_prefix,
           query_file, gt_file, disk_file_path, disk_graph_prefix, graph_rep_index_prefix,
           num_threads, K, W, num_nodes_to_cache, search_io_limit, Lvec, mem_L, sector_len,
           use_page_search, use_ratio, pq_ratio, deco_impl,
-          use_graph_rep_index, (enable_region_layout || enable_region_physical_reorder), mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace, enable_trace_v2, trace_v2_output_dir, enable_region_io_trace, region_io_trace_dir, region_file);
+          use_graph_rep_index, (enable_region_layout || enable_region_physical_reorder), mem_graph_use_ratio, mem_emb_use_ratio, emb_search_ratio, collect_transition_trace, enable_trace_v2, trace_v2_output_dir, enable_region_io_trace, region_io_trace_dir, region_file, enable_global_qd_control, global_qd_cap, qd_control_trace, enable_region_prefetch, region_prefetch_size, region_buffer_policy, region_cache_limit_bytes_per_query, region_cache_overflow_policy, region_prefetch_stats_file, deterministic_logical_page_processing);
     else {
       std::cerr << "Unsupported data type. Use float or int8 or uint8"
                 << std::endl;

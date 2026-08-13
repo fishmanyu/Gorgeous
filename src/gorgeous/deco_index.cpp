@@ -9,6 +9,7 @@
 #include "percentile_stats.h"
 
 #include <omp.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -63,8 +64,16 @@ namespace diskann {
       delete[] data;
     }
 
-    if (centroid_data != nullptr)
+    if (centroid_data != nullptr) {
       aligned_free(centroid_data);
+      centroid_data = nullptr;
+    }
+
+    delete[] medoids;
+    medoids = nullptr;
+
+    delete cached_popular;
+    cached_popular = nullptr;
 
     if (load_flag) {
       this->destroy_thread_data();
@@ -128,7 +137,13 @@ namespace diskann {
       diskann::aligned_free((void *) scratch.aligned_query_T);
 
       delete scratch.visited;
+      delete scratch.pq_calculated;
       delete scratch.page_visited;
+      delete scratch.exact_visited;
+      scratch.visited = nullptr;
+      scratch.pq_calculated = nullptr;
+      scratch.page_visited = nullptr;
+      scratch.exact_visited = nullptr;
     }
     this->io_manager->deregister_all_threads();
   }
@@ -168,6 +183,169 @@ namespace diskann {
              << "page_owner,scan_kind,neighbor,accepted,first_accepted,"
              << "neighbor_arrival_parent_after_scan,neighbor_distance,graph_io,is_replica,physical_page_id\n";
     }
+  }
+
+  template<typename T>
+  void DecoIndex<T>::configure_region_prefetch(bool enabled,
+                                               const std::string &region_file,
+                                               unsigned region_size,
+                                               uint64_t cache_limit_bytes_per_query,
+                                               const std::string &buffer_policy,
+                                               const std::string &overflow_policy) {
+    enable_region_prefetch_ = enabled;
+    region_prefetch_size_ = region_size;
+    region_cache_limit_bytes_per_query_ = cache_limit_bytes_per_query;
+    region_buffer_policy_ = buffer_policy;
+    region_cache_overflow_policy_ = overflow_policy;
+    region_prefetch_owner_to_region_.clear();
+    region_prefetch_owner_to_position_.clear();
+    region_prefetch_regions_.clear();
+    region_prefetch_physical_base_.clear();
+    region_prefetch_mapping_valid_ = false;
+
+    std::cout << "region_prefetch: " << (enable_region_prefetch_ ? "enabled" : "disabled")
+              << ", size=" << region_prefetch_size_
+              << ", buffer_policy=" << region_buffer_policy_
+              << ", cache_limit_bytes_per_query=" << region_cache_limit_bytes_per_query_
+              << ", overflow_policy=" << region_cache_overflow_policy_
+              << ", region_file=" << region_file << std::endl;
+
+    if (!enable_region_prefetch_) {
+      return;
+    }
+    if (!enable_region_layout_) {
+      std::cerr << "Region prefetch requires --enable_region_physical_reorder 1 so regions map to contiguous physical pages." << std::endl;
+      std::exit(2);
+    }
+    if (region_prefetch_size_ != 4) {
+      std::cerr << "Task 3A supports only region_prefetch_size=4." << std::endl;
+      std::exit(2);
+    }
+    if (region_buffer_policy_ != "query_lifetime") {
+      std::cerr << "Task 3A supports only region_buffer_policy=query_lifetime." << std::endl;
+      std::exit(2);
+    }
+    if (region_cache_overflow_policy_ != "abort") {
+      std::cerr << "Task 3A supports only region_cache_overflow_policy=abort." << std::endl;
+      std::exit(2);
+    }
+    if (region_file.empty()) {
+      std::cerr << "Region prefetch requires --region_file <regions.tsv>." << std::endl;
+      std::exit(2);
+    }
+
+    std::ifstream reader(region_file);
+    if (!reader) {
+      std::cerr << "Failed to open region file for prefetch: " << region_file << std::endl;
+      std::exit(2);
+    }
+    std::string line;
+    uint64_t records = 0;
+    while (std::getline(reader, line)) {
+      if (line.empty() || line.rfind("region_id", 0) == 0) continue;
+      std::istringstream iss(line);
+      unsigned region_id = INF, position = INF, page_id = INF;
+      if (!(iss >> region_id >> position >> page_id)) continue;
+      if (position >= region_prefetch_size_) {
+        std::cerr << "Region file position exceeds region_prefetch_size: region=" << region_id
+                  << " position=" << position << std::endl;
+        std::exit(2);
+      }
+      if (region_id >= region_prefetch_regions_.size()) {
+        region_prefetch_regions_.resize(static_cast<size_t>(region_id) + 1);
+      }
+      if (region_prefetch_regions_[region_id].empty()) {
+        region_prefetch_regions_[region_id].assign(region_prefetch_size_, INF);
+      }
+      if (region_prefetch_regions_[region_id][position] != INF) {
+        std::cerr << "Duplicate region position in region file: region=" << region_id
+                  << " position=" << position << std::endl;
+        std::exit(2);
+      }
+      region_prefetch_regions_[region_id][position] = page_id;
+      if (page_id >= region_prefetch_owner_to_region_.size()) {
+        region_prefetch_owner_to_region_.resize(static_cast<size_t>(page_id) + 1, INF);
+        region_prefetch_owner_to_position_.resize(static_cast<size_t>(page_id) + 1, INF);
+      }
+      if (region_prefetch_owner_to_region_[page_id] != INF) {
+        std::cerr << "Page appears in multiple regions for prefetch: page=" << page_id << std::endl;
+        std::exit(2);
+      }
+      region_prefetch_owner_to_region_[page_id] = region_id;
+      region_prefetch_owner_to_position_[page_id] = position;
+      records++;
+    }
+
+    region_prefetch_physical_base_.assign(region_prefetch_regions_.size(), INF);
+    uint64_t complete_regions = 0;
+    for (unsigned rid = 0; rid < region_prefetch_regions_.size(); rid++) {
+      const auto &pages = region_prefetch_regions_[rid];
+      if (pages.empty()) continue;
+      bool complete = true;
+      for (unsigned pos = 0; pos < region_prefetch_size_; pos++) {
+        if (pages[pos] == INF) {
+          complete = false;
+          continue;
+        }
+        if (pages[pos] >= id2page_.size()) {
+          std::cerr << "Region page id exceeds id2page mapping: page=" << pages[pos] << std::endl;
+          std::exit(2);
+        }
+      }
+      if (!complete) {
+        for (unsigned pos = 0; pos < region_prefetch_size_; pos++) {
+          if (pages[pos] != INF && pages[pos] < region_prefetch_owner_to_region_.size()) {
+            region_prefetch_owner_to_region_[pages[pos]] = INF;
+            region_prefetch_owner_to_position_[pages[pos]] = INF;
+          }
+        }
+        continue;
+      }
+      std::vector<unsigned> physicals;
+      physicals.reserve(region_prefetch_size_);
+      for (unsigned pos = 0; pos < region_prefetch_size_; pos++) {
+        physicals.push_back(id2page_[pages[pos]]);
+      }
+      std::vector<unsigned> sorted = physicals;
+      std::sort(sorted.begin(), sorted.end());
+      for (unsigned pos = 1; pos < region_prefetch_size_; pos++) {
+        if (sorted[pos] != sorted[0] + pos) {
+          std::cerr << "Region is not physically contiguous; aborting online prefetch. region=" << rid
+                    << " physicals=";
+          for (auto p : physicals) std::cerr << p << " ";
+          std::cerr << std::endl;
+          std::exit(2);
+        }
+      }
+      if (sorted[0] + region_prefetch_size_ > num_points) {
+        std::cerr << "Region read would pass graph file tail: region=" << rid
+                  << " base=" << sorted[0] << " size=" << region_prefetch_size_ << std::endl;
+        std::exit(2);
+      }
+      region_prefetch_physical_base_[rid] = sorted[0];
+      complete_regions++;
+    }
+    region_prefetch_mapping_valid_ = true;
+    std::cout << "region_prefetch loaded: records=" << records
+              << ", regions=" << region_prefetch_regions_.size()
+              << ", complete_regions=" << complete_regions << std::endl;
+  }
+
+  template<typename T>
+  void DecoIndex<T>::configure_global_qd_control(bool enabled, unsigned cap, bool trace_enabled) {
+    enable_global_qd_control_ = enabled;
+    global_qd_cap_ = cap;
+    qd_control_trace_ = trace_enabled;
+    std::cout << "global_qd_control: " << (enable_global_qd_control_ ? "enabled" : "disabled")
+              << ", cap=" << global_qd_cap_
+              << ", trace=" << (qd_control_trace_ ? "enabled" : "disabled") << std::endl;
+  }
+
+  template<typename T>
+  void DecoIndex<T>::configure_deterministic_logical_page_processing(bool enabled) {
+    deterministic_logical_page_processing_ = enabled;
+    std::cout << "deterministic_logical_page_processing: "
+              << (deterministic_logical_page_processing_ ? "enabled" : "disabled") << std::endl;
   }
 
   template<typename T>
@@ -212,7 +390,25 @@ namespace diskann {
     {
       std::ofstream writer(region_io_trace_dir_ + "/query_io_summary.csv", std::ios::out);
       writer << "query_id,thread_id,graph_io_batches,graph_io_requests,submit_us,completion_wait_us,"
-             << "page_process_us,read_disk_us,total_us\n";
+             << "page_process_us,read_disk_us,total_us,qd_control_wait_us,qd_control_wait_events,"
+             << "qd_control_split_submit_groups\n";
+    }
+    {
+      std::ofstream writer(region_io_trace_dir_ + "/stage_g_batch_timeline.csv", std::ios::out);
+      writer << "query_id,thread_id,logical_batch_id,submit_group_id,batch_size,submit_before_ns,"
+             << "submit_after_ns,submitted_count,per_context_inflight_before,"
+             << "per_context_inflight_after_submit,global_inflight_before,global_inflight_after_submit,"
+             << "first_completion_ns,last_completion_ns,first_getevents_begin_ns,last_getevents_end_ns,"
+             << "logical_owner_key,physical_page_key,request_order_key\n";
+    }
+    {
+      std::ofstream writer(region_io_trace_dir_ + "/stage_g_request_timeline.csv", std::ios::out);
+      writer << "request_id,query_id,thread_id,submit_group_id,request_index,owner_node_id,"
+             << "physical_page_id,submit_ns,completion_ns,completion_order,result_code\n";
+    }
+    {
+      std::ofstream writer(region_io_trace_dir_ + "/stage_g_qd_events.csv", std::ios::out);
+      writer << "timestamp_ns,thread_id,delta,global_inflight_after,per_context_inflight_after,event\n";
     }
   }
 

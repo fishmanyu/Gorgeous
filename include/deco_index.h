@@ -6,6 +6,8 @@
 #include <sstream>
 #include <fstream>
 #include <mutex>
+#include <condition_variable>
+#include <array>
 #include <stack>
 #include <string>
 #include "tsl/robin_map.h"
@@ -76,6 +78,16 @@ namespace diskann {
     DISKANN_DLLEXPORT void enable_region_io_trace(bool enabled,
                                                   const std::string &trace_dir = "logs/region_io_trace",
                                                   const std::string &region_file = "");
+    DISKANN_DLLEXPORT void configure_region_prefetch(bool enabled,
+                                                     const std::string &region_file = "",
+                                                     unsigned region_size = 4,
+                                                     uint64_t cache_limit_bytes_per_query = 16ULL * 1024ULL * 1024ULL,
+                                                     const std::string &buffer_policy = "query_lifetime",
+                                                     const std::string &overflow_policy = "abort");
+    DISKANN_DLLEXPORT void configure_global_qd_control(bool enabled,
+                                                       unsigned cap,
+                                                       bool trace_enabled = false);
+    DISKANN_DLLEXPORT void configure_deterministic_logical_page_processing(bool enabled);
 
     std::shared_ptr<FileIOManager> &io_manager;
 
@@ -191,6 +203,22 @@ namespace diskann {
     std::string region_io_trace_dir_ = "logs/region_io_trace";
     std::mutex region_io_trace_mutex_;
     std::vector<unsigned> region_io_owner_to_region_;
+
+    bool enable_region_prefetch_ = false;
+    unsigned region_prefetch_size_ = 4;
+    uint64_t region_cache_limit_bytes_per_query_ = 16ULL * 1024ULL * 1024ULL;
+    std::string region_buffer_policy_ = "query_lifetime";
+    std::string region_cache_overflow_policy_ = "abort";
+    std::vector<unsigned> region_prefetch_owner_to_region_;
+    std::vector<unsigned> region_prefetch_owner_to_position_;
+    std::vector<std::vector<unsigned>> region_prefetch_regions_;
+    std::vector<unsigned> region_prefetch_physical_base_;
+    bool region_prefetch_mapping_valid_ = false;
+
+    bool enable_global_qd_control_ = false;
+    unsigned global_qd_cap_ = 0;
+    bool qd_control_trace_ = false;
+    bool deterministic_logical_page_processing_ = false;
     // id2 graph partition page and gp layout.
     std::vector<unsigned> id2page_;
     std::vector<std::vector<unsigned>> gp_layout_;

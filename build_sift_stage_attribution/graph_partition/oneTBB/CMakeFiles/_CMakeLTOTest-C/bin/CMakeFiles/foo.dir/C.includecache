@@ -1,0 +1,10 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/yqr/work/Gorgeous/build_sift_stage_attribution/graph_partition/oneTBB/CMakeFiles/_CMakeLTOTest-C/src/foo.c
+

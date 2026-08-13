@@ -38,6 +38,54 @@ namespace diskann {
     unsigned n_cache_hits = 0;  // # cache_hits
     unsigned n_hops = 0;        // # search hops
 
+    uint64_t region_prefetch_enabled = 0;
+    uint64_t region_prefetch_overflow = 0;
+    uint64_t region_logical_graph_ios = 0;
+    uint64_t region_device_read_submits = 0;
+    uint64_t region_device_read_bytes = 0;
+    uint64_t region_device_4kb_reads = 0;
+    uint64_t region_device_16kb_reads = 0;
+    uint64_t region_first_triggers = 0;
+    uint64_t region_cache_hits = 0;
+    uint64_t region_loaded_regions = 0;
+    uint64_t region_additional_pages_read = 0;
+    uint64_t region_additional_pages_used = 0;
+    uint64_t region_unused_additional_pages = 0;
+    uint64_t region_duplicate_load_attempts = 0;
+    uint64_t region_same_region_pending_frontier_count = 0;
+    uint64_t region_pending_waiter_registered_count = 0;
+    uint64_t region_pending_waiter_processed_count = 0;
+    uint64_t region_pending_waiter_duplicate_count = 0;
+    uint64_t region_requested_page_parse_count = 0;
+    uint64_t region_prefetched_only_page_parse_count = 0;
+    uint64_t region_pending_region_leftover_at_query_end = 0;
+    uint64_t region_waiter_registered_but_not_processed = 0;
+    uint64_t region_duplicate_region_submission_count = 0;
+    uint64_t region_duplicate_logical_page_process_count = 0;
+    uint64_t region_slice_byte_mismatch_count = 0;
+    uint64_t region_cache_entries_released_at_query_end = 0;
+    uint64_t region_cache_leftover_after_cleanup = 0;
+    uint64_t region_cache_peak_bytes = 0;
+    uint64_t region_cache_allocations = 0;
+    uint64_t region_cache_frees = 0;
+    float region_lookup_us = 0;
+    float region_cache_manage_us = 0;
+
+    uint64_t deterministic_logical_page_processing_enabled = 0;
+    uint64_t deterministic_logical_page_request_count = 0;
+    uint64_t deterministic_logical_request_seq_assigned_count = 0;
+    uint64_t deterministic_logical_page_ready_count = 0;
+    uint64_t deterministic_logical_page_processed_count = 0;
+    uint64_t deterministic_logical_page_duplicate_request_count = 0;
+    uint64_t deterministic_logical_page_duplicate_process_count = 0;
+    uint64_t deterministic_queue_insert_count = 0;
+    uint64_t deterministic_queue_max_depth = 0;
+    uint64_t deterministic_queue_leftover_at_query_end = 0;
+    uint64_t deterministic_requested_but_not_processed_count = 0;
+    uint64_t deterministic_processed_without_request_count = 0;
+    uint64_t deterministic_physical_io_submission_count = 0;
+    uint64_t deterministic_logical_to_physical_coalescing_count = 0;
+
 #ifdef ENABLE_REPLICA_REDUNDANCY_STATS
     uint64_t replica_graph_page_ios = 0;
     uint64_t replica_first_read_pages = 0;

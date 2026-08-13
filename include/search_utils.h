@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 #include "utils.h"
 #include "tsl/robin_map.h"
 #include "tsl/robin_set.h"
@@ -114,6 +115,7 @@ namespace diskann {
     int fid;
     char* node_buf;
     char* sector_buf;
+    uint64_t logical_request_seq;
     // Pointer to the search path node in the same block.
     // These nodes are execute directly, such that can init the struct here.
     // If a node is not a target, then this field will be empty.
@@ -127,6 +129,7 @@ namespace diskann {
         this->id = id;
         this->pid = pid;
         this->fid = fid;  // here we consider we have only one file.
+        this->logical_request_seq = UINT64_MAX;
     }
   };
 

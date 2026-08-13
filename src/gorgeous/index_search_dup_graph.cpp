@@ -2,9 +2,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <numeric>
+#include <map>
 #include <sstream>
+#include <time.h>
 #include "logger.h"
 #include "percentile_stats.h"
 #include "replica_redundancy_stats.h"
@@ -158,11 +164,65 @@ namespace diskann {
     double page_process_us;
     double read_disk_us;
     double total_us;
+    double qd_control_wait_us;
+    unsigned qd_control_wait_events;
+    unsigned qd_control_split_submit_groups;
+  };
+
+  struct GraphIOTimestampBatchRow {
+    size_t query_id;
+    unsigned thread_id;
+    unsigned logical_batch_id;
+    unsigned submit_group_id;
+    unsigned batch_size;
+    uint64_t submit_before_ns;
+    uint64_t submit_after_ns;
+    unsigned submitted_count;
+    int64_t per_context_inflight_before;
+    int64_t per_context_inflight_after_submit;
+    int64_t global_inflight_before;
+    int64_t global_inflight_after_submit;
+    uint64_t first_completion_ns;
+    uint64_t last_completion_ns;
+    uint64_t first_getevents_begin_ns;
+    uint64_t last_getevents_end_ns;
+    std::string logical_owner_key;
+    std::string physical_page_key;
+    std::string request_order_key;
+  };
+
+  struct GraphIOTimestampRequestRow {
+    uint64_t request_id;
+    size_t query_id;
+    unsigned thread_id;
+    unsigned submit_group_id;
+    unsigned request_index;
+    unsigned owner_node_id;
+    unsigned physical_page_id;
+    uint64_t submit_ns;
+    uint64_t completion_ns;
+    unsigned completion_order;
+    int result_code;
+  };
+
+  struct GraphIOQDEventRow {
+    uint64_t timestamp_ns;
+    unsigned thread_id;
+    int delta;
+    int64_t global_inflight_after;
+    int64_t per_context_inflight_after;
+    const char *event;
   };
 
   static inline double region_io_now_us() {
     using clock = std::chrono::steady_clock;
     return std::chrono::duration<double, std::micro>(clock::now().time_since_epoch()).count();
+  }
+
+  static inline uint64_t region_io_now_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + static_cast<uint64_t>(ts.tv_nsec);
   }
 
 
@@ -197,11 +257,24 @@ namespace diskann {
     std::vector<std::vector<GraphIOBatchTraceRow>> region_io_thread_batches(trace_v2_thread_count);
     std::vector<std::vector<GraphIORequestTraceRow>> region_io_thread_requests(trace_v2_thread_count);
     std::vector<std::vector<GraphIOQueryTraceRow>> region_io_thread_queries(trace_v2_thread_count);
+    std::vector<std::vector<GraphIOTimestampBatchRow>> region_io_thread_ts_batches(trace_v2_thread_count);
+    std::vector<std::vector<GraphIOTimestampRequestRow>> region_io_thread_ts_requests(trace_v2_thread_count);
+    std::vector<std::vector<GraphIOQDEventRow>> region_io_thread_qd_events(trace_v2_thread_count);
+    std::atomic<int64_t> region_io_global_inflight{0};
+    std::atomic<uint64_t> region_io_next_request_id{0};
+    const bool enable_global_qd_control = enable_global_qd_control_ && global_qd_cap_ > 0;
+    const unsigned global_qd_cap = global_qd_cap_ == 0 ? 1 : global_qd_cap_;
+    std::mutex global_qd_control_mutex;
+    std::condition_variable global_qd_control_cv;
+    int64_t global_qd_control_inflight = 0;
     if (collect_region_io_trace) {
       for (size_t i = 0; i < trace_v2_thread_count; i++) {
         region_io_thread_batches[i].reserve(std::max<size_t>(4096, query_num * 96));
         region_io_thread_requests[i].reserve(std::max<size_t>(8192, query_num * 128));
         region_io_thread_queries[i].reserve(std::max<size_t>(1024, query_num / trace_v2_thread_count + 8));
+        region_io_thread_ts_batches[i].reserve(std::max<size_t>(4096, query_num * 96));
+        region_io_thread_ts_requests[i].reserve(std::max<size_t>(8192, query_num * 128));
+        region_io_thread_qd_events[i].reserve(std::max<size_t>(8192, query_num * 128));
       }
     }
     if (trace_v2_batch_postwrite) {
@@ -258,15 +331,91 @@ namespace diskann {
         std::vector<GraphIOBatchTraceRow> region_io_batches;
         std::vector<GraphIORequestTraceRow> region_io_requests;
         tsl::robin_map<char*, size_t> region_io_buf_to_batch;
+        std::vector<GraphIOTimestampBatchRow> region_io_ts_batches;
+        std::vector<GraphIOTimestampRequestRow> region_io_ts_requests;
+        std::vector<GraphIOQDEventRow> region_io_qd_events;
+        tsl::robin_map<char*, size_t> region_io_buf_to_ts_request;
+        int64_t region_io_context_inflight = 0;
+        unsigned region_io_completion_order = 0;
         unsigned region_io_next_batch_id = 0;
         unsigned region_io_request_count = 0;
         double region_io_submit_us_total = 0.0;
         double region_io_wait_us_total = 0.0;
         double region_io_page_process_us_total = 0.0;
+        double qd_control_wait_us_total = 0.0;
+        unsigned qd_control_wait_events = 0;
+        unsigned qd_control_split_submit_groups = 0;
+
+        struct QueryRegionCacheEntry {
+          unsigned region_id = INF;
+          unsigned trigger_pid = INF;
+          unsigned physical_base = INF;
+          char *region_buf = nullptr;
+          bool complete = false;
+          std::array<bool, 4> used{{false, false, false, false}};
+          std::array<bool, 4> trigger{{false, false, false, false}};
+        };
+        std::vector<QueryRegionCacheEntry> query_region_cache;
+        tsl::robin_map<unsigned, size_t> region_id_to_cache_idx;
+        tsl::robin_map<unsigned, char*> region_physical_page_to_buf;
+        tsl::robin_set<unsigned> pending_region_ids;
+        tsl::robin_map<unsigned, std::vector<std::shared_ptr<FrontierNode>>> pending_region_waiters;
+        tsl::robin_map<char*, size_t> region_read_buf_to_cache_idx;
+        uint64_t region_cache_bytes = 0;
+        uint64_t region_cache_peak_bytes = 0;
+        uint64_t region_cache_allocations = 0;
+        uint64_t region_cache_frees = 0;
+        uint64_t region_cache_manage_us_accum = 0;
+        uint64_t region_lookup_us_accum = 0;
+        uint64_t region_same_region_pending_frontier_count = 0;
+        uint64_t region_pending_waiter_registered_count = 0;
+        uint64_t region_pending_waiter_processed_count = 0;
+        uint64_t region_pending_waiter_duplicate_count = 0;
+        uint64_t region_requested_page_parse_count = 0;
+        uint64_t region_prefetched_only_page_parse_count = 0;
+        uint64_t region_duplicate_region_submission_count = 0;
+        uint64_t region_duplicate_logical_page_process_count = 0;
+        uint64_t region_slice_byte_mismatch_count = 0;
+        uint64_t region_cache_entries_released_at_query_end = 0;
+        uint64_t region_cache_leftover_after_cleanup = 0;
+        tsl::robin_set<unsigned> region_processed_logical_pages;
+        uint64_t deterministic_logical_page_request_count = 0;
+        uint64_t deterministic_logical_request_seq_assigned_count = 0;
+        uint64_t deterministic_logical_page_ready_count = 0;
+        uint64_t deterministic_logical_page_processed_count = 0;
+        uint64_t deterministic_logical_page_duplicate_request_count = 0;
+        uint64_t deterministic_logical_page_duplicate_process_count = 0;
+        uint64_t deterministic_queue_insert_count = 0;
+        uint64_t deterministic_queue_max_depth = 0;
+        uint64_t deterministic_processed_without_request_count = 0;
+        uint64_t deterministic_physical_io_submission_count = 0;
+        uint64_t deterministic_logical_to_physical_coalescing_count = 0;
+        uint64_t deterministic_next_request_seq = 0;
+        uint64_t deterministic_next_process_seq = 0;
+        tsl::robin_set<uint64_t> deterministic_processed_seqs;
+        struct DeterministicReadyPage {
+          char *page_buf = nullptr;
+          std::shared_ptr<FrontierNode> fn;
+        };
+        std::map<uint64_t, DeterministicReadyPage> deterministic_ready_pages;
+        bool region_prefetch_overflow = false;
+        if (enable_region_prefetch_) {
+          query_region_cache.reserve(256);
+          region_id_to_cache_idx.reserve(256);
+          region_physical_page_to_buf.reserve(1024);
+          pending_region_ids.reserve(256);
+          pending_region_waiters.reserve(256);
+          region_read_buf_to_cache_idx.reserve(256);
+          region_processed_logical_pages.reserve(1024);
+        }
         if (collect_region_io_trace) {
           region_io_batches.reserve(256);
           region_io_requests.reserve(512);
           region_io_buf_to_batch.reserve(512);
+          region_io_ts_batches.reserve(256);
+          region_io_ts_requests.reserve(512);
+          region_io_qd_events.reserve(512);
+          region_io_buf_to_ts_request.reserve(512);
         }
 
         // get the current query pointers
@@ -274,6 +423,10 @@ namespace diskann {
         _u64* indices = indices_vec.data() + (task_id * k_search);
         float* distances = distances_vec.data() + (task_id * k_search);
         QueryStats* stats = stats_ptr + task_id;
+        if (stats != nullptr) {
+          if (enable_region_prefetch_) stats->region_prefetch_enabled = 1;
+          if (deterministic_logical_page_processing_) stats->deterministic_logical_page_processing_enabled = 1;
+        }
 #ifdef ENABLE_REPLICA_REDUNDANCY_STATS
         ReplicaRedundancyTracker replica_redundancy_tracker;
 #endif
@@ -355,6 +508,108 @@ namespace diskann {
           return owner < region_io_owner_to_region_.size() ? region_io_owner_to_region_[owner] : INF;
         };
 
+        auto prefetch_region_id = [this](const unsigned owner) -> unsigned {
+          return owner < region_prefetch_owner_to_region_.size() ? region_prefetch_owner_to_region_[owner] : INF;
+        };
+
+        auto region_cache_slot_for_physical = [this](const unsigned region_id, const unsigned physical_pid) -> unsigned {
+          if (region_id == INF || region_id >= region_prefetch_physical_base_.size()) return INF;
+          const unsigned base = region_prefetch_physical_base_[region_id];
+          if (base == INF || physical_pid < base || physical_pid >= base + region_prefetch_size_) return INF;
+          return physical_pid - base;
+        };
+
+        auto region_cache_record_use = [&](const unsigned physical_pid) {
+          auto buf_it = region_physical_page_to_buf.find(physical_pid);
+          if (buf_it == region_physical_page_to_buf.end()) return;
+          for (auto &entry : query_region_cache) {
+            if (!entry.complete || entry.region_buf == nullptr) continue;
+            const unsigned slot = region_cache_slot_for_physical(entry.region_id, physical_pid);
+            if (slot != INF && slot < region_prefetch_size_ && entry.region_buf + static_cast<size_t>(slot) * GR_SECTOR_LEN == buf_it->second) {
+              entry.used[slot] = true;
+              return;
+            }
+          }
+        };
+
+        auto register_pending_region_waiter = [&](const unsigned rid, const std::shared_ptr<FrontierNode> &fn) {
+          auto &waiters = pending_region_waiters[rid];
+          for (const auto &existing : waiters) {
+            if (existing && existing->pid == fn->pid && existing->id == fn->id) {
+              region_pending_waiter_duplicate_count++;
+              return false;
+            }
+          }
+          waiters.push_back(fn);
+          region_pending_waiter_registered_count++;
+          return true;
+        };
+
+        auto region_cache_finalize_query = [&]() {
+          if (!enable_region_prefetch_) return;
+          uint64_t additional_pages_read = 0;
+          uint64_t additional_pages_used = 0;
+          for (auto &entry : query_region_cache) {
+            for (unsigned pos = 0; pos < region_prefetch_size_; pos++) {
+              if (!entry.trigger[pos]) {
+                additional_pages_read++;
+                if (entry.used[pos]) additional_pages_used++;
+              }
+            }
+            if (entry.region_buf != nullptr) {
+              diskann::aligned_free(entry.region_buf);
+              entry.region_buf = nullptr;
+              region_cache_frees++;
+              region_cache_entries_released_at_query_end++;
+            }
+          }
+          uint64_t pending_waiters_left = 0;
+          for (const auto &kv : pending_region_waiters) {
+            pending_waiters_left += static_cast<uint64_t>(kv.second.size());
+          }
+          if (stats != nullptr) {
+            stats->region_prefetch_overflow = region_prefetch_overflow ? 1 : 0;
+            stats->region_loaded_regions = static_cast<uint64_t>(query_region_cache.size());
+            stats->region_additional_pages_read = additional_pages_read;
+            stats->region_additional_pages_used = additional_pages_used;
+            stats->region_unused_additional_pages = additional_pages_read >= additional_pages_used ? additional_pages_read - additional_pages_used : 0;
+            stats->region_same_region_pending_frontier_count = region_same_region_pending_frontier_count;
+            stats->region_pending_waiter_registered_count = region_pending_waiter_registered_count;
+            stats->region_pending_waiter_processed_count = region_pending_waiter_processed_count;
+            stats->region_pending_waiter_duplicate_count = region_pending_waiter_duplicate_count;
+            stats->region_requested_page_parse_count = region_requested_page_parse_count;
+            stats->region_prefetched_only_page_parse_count = region_prefetched_only_page_parse_count;
+            stats->region_pending_region_leftover_at_query_end = static_cast<uint64_t>(pending_region_ids.size()) + pending_waiters_left;
+            stats->region_waiter_registered_but_not_processed = region_pending_waiter_registered_count >= region_pending_waiter_processed_count ? region_pending_waiter_registered_count - region_pending_waiter_processed_count : 0;
+            stats->region_duplicate_region_submission_count = region_duplicate_region_submission_count;
+            stats->region_duplicate_logical_page_process_count = region_duplicate_logical_page_process_count;
+            stats->region_slice_byte_mismatch_count = region_slice_byte_mismatch_count;
+            stats->region_cache_entries_released_at_query_end = region_cache_entries_released_at_query_end;
+            stats->region_cache_leftover_after_cleanup = 0;
+            stats->region_cache_peak_bytes = region_cache_peak_bytes;
+            stats->region_cache_allocations = region_cache_allocations;
+            stats->region_cache_frees = region_cache_frees;
+            stats->region_lookup_us = static_cast<float>(region_lookup_us_accum);
+            stats->region_cache_manage_us = static_cast<float>(region_cache_manage_us_accum);
+          }
+          query_region_cache.clear();
+          region_id_to_cache_idx.clear();
+          region_physical_page_to_buf.clear();
+          pending_region_ids.clear();
+          pending_region_waiters.clear();
+          region_read_buf_to_cache_idx.clear();
+          region_cache_bytes = 0;
+          region_cache_leftover_after_cleanup = static_cast<uint64_t>(query_region_cache.size()) +
+              static_cast<uint64_t>(region_id_to_cache_idx.size()) +
+              static_cast<uint64_t>(region_physical_page_to_buf.size()) +
+              static_cast<uint64_t>(pending_region_ids.size()) +
+              static_cast<uint64_t>(pending_region_waiters.size()) +
+              static_cast<uint64_t>(region_read_buf_to_cache_idx.size()) + region_cache_bytes;
+          if (stats != nullptr) {
+            stats->region_cache_leftover_after_cleanup = region_cache_leftover_after_cleanup;
+          }
+        };
+
         auto percentile_from_sorted = [](const std::vector<uint64_t> &vals, double p) -> double {
           if (vals.empty()) return 0.0;
           size_t idx = static_cast<size_t>(p * static_cast<double>(vals.size()));
@@ -365,7 +620,12 @@ namespace diskann {
         auto append_region_io_batch = [&](const std::vector<std::shared_ptr<FrontierNode>> &frontier_nodes,
                                           const size_t begin_idx, const size_t end_idx,
                                           const double construct_us, const double prep_us,
-                                          const double submit_us, const double submit_return_us) {
+                                          const double submit_us, const double submit_return_us,
+                                          const uint64_t submit_before_ns, const uint64_t submit_after_ns,
+                                          const int64_t per_context_inflight_before,
+                                          const int64_t per_context_inflight_after_submit,
+                                          const int64_t global_inflight_before,
+                                          const int64_t global_inflight_after_submit) {
           if (!collect_region_io_trace || begin_idx >= end_idx) return;
           const unsigned batch_id = region_io_next_batch_id++;
           std::vector<unsigned> owners;
@@ -375,6 +635,8 @@ namespace diskann {
           physicals.reserve(end_idx - begin_idx);
           regions.reserve(end_idx - begin_idx);
           std::ostringstream key;
+          std::ostringstream physical_key;
+          std::ostringstream request_order_key;
           for (size_t i = begin_idx; i < end_idx; i++) {
             const unsigned owner = frontier_nodes[i]->id;
             const unsigned physical = frontier_nodes[i]->pid;
@@ -384,9 +646,20 @@ namespace diskann {
             owners.push_back(owner);
             physicals.push_back(physical);
             regions.push_back(region);
+            const unsigned request_index = static_cast<unsigned>(i - begin_idx);
+            if (i > begin_idx) {
+              physical_key << '|';
+              request_order_key << '|';
+            }
+            physical_key << physical;
+            const uint64_t request_id = region_io_next_request_id.fetch_add(1, std::memory_order_relaxed);
+            request_order_key << request_id;
             region_io_requests.push_back({task_id, static_cast<unsigned>(tid), batch_id,
-                                          static_cast<unsigned>(i - begin_idx), owner, physical,
+                                          request_index, owner, physical,
                                           static_cast<uint64_t>(physical) * GR_SECTOR_LEN + GR_SECTOR_LEN, region});
+            region_io_ts_requests.push_back({request_id, task_id, static_cast<unsigned>(tid), batch_id,
+                                             request_index, owner, physical, submit_before_ns, 0, INF, 0});
+            region_io_buf_to_ts_request[frontier_nodes[i]->sector_buf] = region_io_ts_requests.size() - 1;
           }
           std::vector<unsigned> sorted_phys = physicals;
           std::sort(sorted_phys.begin(), sorted_phys.end());
@@ -424,6 +697,12 @@ namespace diskann {
                                        percentile_from_sorted(gaps, 0.99), contiguous, ratio(le1), ratio(le4), ratio(le16),
                                        ratio(le64), ratio(same_region), construct_us, prep_us, submit_us, 0.0, 0.0, 0.0,
                                        0.0, 0.0, 0.0, static_cast<unsigned>(physicals.size()), false, submit_return_us});
+          region_io_ts_batches.push_back({task_id, static_cast<unsigned>(tid), batch_id, batch_id,
+                                        static_cast<unsigned>(physicals.size()), submit_before_ns, submit_after_ns,
+                                        static_cast<unsigned>(physicals.size()), per_context_inflight_before,
+                                        per_context_inflight_after_submit, global_inflight_before,
+                                        global_inflight_after_submit, 0, 0, 0, 0, key.str(), physical_key.str(),
+                                        request_order_key.str()});
           const size_t batch_index = region_io_batches.size() - 1;
           for (size_t i = begin_idx; i < end_idx; i++) {
             region_io_buf_to_batch[frontier_nodes[i]->sector_buf] = batch_index;
@@ -629,6 +908,35 @@ namespace diskann {
           }
         };
 
+        auto process_graph_page = [&](char *page_buf, const std::shared_ptr<FrontierNode> &fn) {
+          const _u32 exact_id = fn->id;
+          const float exact_dist = compute_exact_dists_and_push(page_buf, exact_id);
+          char *node_buf = page_buf + emb_node_len + sizeof(unsigned) * (1 + n_gc_node_per_sector);
+          unsigned *p_layout = (unsigned*)(page_buf + emb_node_len);
+          unsigned p_size = *(p_layout++);
+#ifdef ENABLE_REPLICA_REDUNDANCY_STATS
+          std::vector<uint32_t> replica_adjacency_ids;
+          if (p_size > 1) {
+            replica_adjacency_ids.reserve(p_size - 1);
+          }
+          for (unsigned j = 1; j < p_size; j++) {
+            replica_adjacency_ids.push_back(static_cast<uint32_t>(p_layout[j]));
+          }
+          replica_redundancy_tracker.record_page(
+              static_cast<uint32_t>(fn->pid), static_cast<uint32_t>(exact_id),
+              replica_adjacency_ids);
+#endif
+          for (unsigned j = 1; j < p_size; j++) {
+            if (node_in_mem_pos(p_layout[j]) == INF) {
+              char *nnbr_buf = node_buf + j * graph_node_len;
+              loaded.insert({p_layout[j], nnbr_buf});
+              loaded_parent.insert({p_layout[j], exact_id});
+            }
+          }
+          const unsigned retset_pos = selected_retset_position.find(exact_id) == selected_retset_position.end() ? INF : selected_retset_position[exact_id];
+          compute_and_push_nbrs_target_update(node_buf, exact_id, INF, false, true, static_cast<unsigned>(fn->pid), retset_pos, exact_dist);
+        };
+
         auto compute_and_add_to_retset = [&](const unsigned *node_ids, const _u64 n_ids) {
           compute_pq_dists(node_ids, n_ids, dist_scratch);
           for (_u64 i = 0; i < n_ids; ++i) {
@@ -667,6 +975,49 @@ namespace diskann {
         _u32 n_cached_in_q = 0; // how many proc left
         _u32 n_proc_in_q = 0; // how many proc left
 
+        auto assign_logical_request_seq = [&](const std::shared_ptr<FrontierNode> &fn) {
+          if (!fn) return;
+          if (fn->logical_request_seq != UINT64_MAX) {
+            deterministic_logical_page_duplicate_request_count++;
+            return;
+          }
+          fn->logical_request_seq = deterministic_next_request_seq++;
+          deterministic_logical_page_request_count++;
+          deterministic_logical_request_seq_assigned_count++;
+        };
+
+        auto queue_page_for_processing = [&](char *page_buf, const std::shared_ptr<FrontierNode> &fn) {
+          if (page_buf == nullptr || !fn) return;
+          sec_buf2ftr[page_buf] = fn;
+          if (!deterministic_logical_page_processing_) {
+            sector_buffers.push(page_buf);
+            n_proc_in_q++;
+            return;
+          }
+          if (fn->logical_request_seq == UINT64_MAX) {
+            deterministic_processed_without_request_count++;
+            fn->logical_request_seq = deterministic_next_request_seq++;
+            deterministic_logical_page_request_count++;
+            deterministic_logical_request_seq_assigned_count++;
+          }
+          deterministic_logical_page_ready_count++;
+          auto inserted = deterministic_ready_pages.emplace(fn->logical_request_seq, DeterministicReadyPage{page_buf, fn});
+          if (!inserted.second) {
+            deterministic_logical_page_duplicate_process_count++;
+            inserted.first->second = DeterministicReadyPage{page_buf, fn};
+          }
+          deterministic_queue_insert_count++;
+          deterministic_queue_max_depth = std::max<uint64_t>(deterministic_queue_max_depth, deterministic_ready_pages.size());
+          while (true) {
+            auto it = deterministic_ready_pages.find(deterministic_next_process_seq);
+            if (it == deterministic_ready_pages.end()) break;
+            sector_buffers.push(it->second.page_buf);
+            n_proc_in_q++;
+            deterministic_ready_pages.erase(it);
+            deterministic_next_process_seq++;
+          }
+        };
+
         while (num_ios < io_limit) {
 
           if (n_proc_in_q > 0) {
@@ -679,35 +1030,18 @@ namespace diskann {
 
             auto fn = sec_buf2ftr[sector_buf];
             const double region_io_page_begin_us = collect_region_io_trace ? region_io_now_us() : 0.0;
-            const _u32 exact_id = fn->id;
-            // calculate exact distance for the target node
-            const float exact_dist = compute_exact_dists_and_push(sector_buf, exact_id);
-            // expand some of the neighbors in page, record the node to expand.
-            char *node_buf = sector_buf + emb_node_len + sizeof(unsigned) * (1 + n_gc_node_per_sector);
-            unsigned *p_layout = (unsigned*)(sector_buf + emb_node_len);
-            unsigned p_size = *(p_layout++);
-#ifdef ENABLE_REPLICA_REDUNDANCY_STATS
-            std::vector<uint32_t> replica_adjacency_ids;
-            if (p_size > 1) {
-              replica_adjacency_ids.reserve(p_size - 1);
+            process_graph_page(sector_buf, fn);
+            if (enable_region_prefetch_ && !region_processed_logical_pages.insert(fn->pid).second) {
+              region_duplicate_logical_page_process_count++;
             }
-            for (unsigned j = 1; j < p_size; j++) {
-              replica_adjacency_ids.push_back(static_cast<uint32_t>(p_layout[j]));
-            }
-            replica_redundancy_tracker.record_page(
-                static_cast<uint32_t>(fn->pid), static_cast<uint32_t>(exact_id),
-                replica_adjacency_ids);
-#endif
-            for (unsigned j = 1; j < p_size; j++) {
-              if (node_in_mem_pos(p_layout[j]) == INF) {
-                char *nnbr_buf = node_buf + j * graph_node_len;
-                loaded.insert({p_layout[j], nnbr_buf});
-                loaded_parent.insert({p_layout[j], exact_id});
+            if (deterministic_logical_page_processing_) {
+              if (fn->logical_request_seq == UINT64_MAX) {
+                deterministic_processed_without_request_count++;
+              } else if (!deterministic_processed_seqs.insert(fn->logical_request_seq).second) {
+                deterministic_logical_page_duplicate_process_count++;
               }
+              deterministic_logical_page_processed_count++;
             }
-            // expand neighbors for target node.
-            const unsigned retset_pos = selected_retset_position.find(exact_id) == selected_retset_position.end() ? INF : selected_retset_position[exact_id];
-            compute_and_push_nbrs_target_update(node_buf, exact_id, INF, false, true, static_cast<unsigned>(fn->pid), retset_pos, exact_dist);
             if (stats != nullptr) stats->disk_proc_us += (double) part_timer.elapsed();
             if (collect_region_io_trace) {
               const double region_io_page_us = region_io_now_us() - region_io_page_begin_us;
@@ -767,7 +1101,9 @@ namespace diskann {
             if (n_proc_in_q == 0) min_r = 1;
             part_timer.reset();
             const double region_io_getevents_begin_us = collect_region_io_trace ? region_io_now_us() : 0.0;
+            const uint64_t region_io_getevents_begin_ns = collect_region_io_trace ? region_io_now_ns() : 0;
             int n_read_blks = io_manager->get_events(ctx, min_r, n_io_in_q, tmp_bufs);
+            const uint64_t region_io_getevents_end_ns = collect_region_io_trace ? region_io_now_ns() : 0;
             const double region_io_getevents_end_us = collect_region_io_trace ? region_io_now_us() : 0.0;
             if (collect_region_io_trace) {
               const double wait_us = region_io_getevents_end_us - region_io_getevents_begin_us;
@@ -787,11 +1123,72 @@ namespace diskann {
                   batch.submit_to_first_completion_us = region_io_getevents_end_us - batch.submit_return_us;
                   batch.saw_first = true;
                 }
+                if (batch_index < region_io_ts_batches.size()) {
+                  auto &ts_batch = region_io_ts_batches[batch_index];
+                  if (ts_batch.first_getevents_begin_ns == 0) {
+                    ts_batch.first_getevents_begin_ns = region_io_getevents_begin_ns;
+                  }
+                  ts_batch.last_getevents_end_ns = region_io_getevents_end_ns;
+                  if (ts_batch.first_completion_ns == 0) {
+                    ts_batch.first_completion_ns = region_io_getevents_end_ns;
+                  }
+                }
               }
             }
             for (int i = n_read_blks - 1; i >= 0; i--) {
-              // check optimistic lock
-              auto fn = sec_buf2ftr[tmp_bufs[i]];
+              char *completed_buf = tmp_bufs[i];
+              char *page_buf_to_process = completed_buf;
+              auto region_read_it = region_read_buf_to_cache_idx.find(completed_buf);
+              if (region_read_it != region_read_buf_to_cache_idx.end() && region_read_it->second < query_region_cache.size()) {
+                auto &entry = query_region_cache[region_read_it->second];
+                entry.complete = true;
+                pending_region_ids.erase(entry.region_id);
+                for (unsigned pos = 0; pos < region_prefetch_size_; pos++) {
+                  const unsigned physical = entry.physical_base + pos;
+                  region_physical_page_to_buf[physical] = entry.region_buf + static_cast<size_t>(pos) * GR_SECTOR_LEN;
+                }
+                const unsigned trigger_slot = region_cache_slot_for_physical(entry.region_id, entry.trigger_pid);
+                if (trigger_slot == INF || trigger_slot >= region_prefetch_size_) {
+                  region_slice_byte_mismatch_count++;
+                  std::cerr << "Completed Region buffer has invalid trigger slot: query_id=" << task_id
+                            << " region=" << entry.region_id << " trigger_pid=" << entry.trigger_pid << std::endl;
+                  std::exit(3);
+                }
+                page_buf_to_process = entry.region_buf + static_cast<size_t>(trigger_slot) * GR_SECTOR_LEN;
+                region_requested_page_parse_count++;
+                auto fn_it = sec_buf2ftr.find(completed_buf);
+                if (fn_it == sec_buf2ftr.end()) {
+                  std::cerr << "Missing FrontierNode for completed Region buffer" << std::endl;
+                  std::exit(3);
+                }
+                fn_it->second->sector_buf = page_buf_to_process;
+                sec_buf2ftr.insert({page_buf_to_process, fn_it->second});
+                if (collect_region_io_trace) {
+                  auto batch_it = region_io_buf_to_batch.find(completed_buf);
+                  if (batch_it != region_io_buf_to_batch.end()) {
+                    region_io_buf_to_batch[page_buf_to_process] = batch_it->second;
+                  }
+                }
+                auto wait_it = pending_region_waiters.find(entry.region_id);
+                if (wait_it != pending_region_waiters.end()) {
+                  for (auto &waiting_fn : wait_it->second) {
+                    const unsigned waiting_slot = region_cache_slot_for_physical(entry.region_id, waiting_fn->pid);
+                    if (waiting_slot == INF || waiting_slot >= region_prefetch_size_) {
+                      region_slice_byte_mismatch_count++;
+                      std::cerr << "Pending Region waiter outside contiguous range: query_id=" << task_id
+                                << " region=" << entry.region_id << " pid=" << waiting_fn->pid << std::endl;
+                      std::exit(3);
+                    }
+                    waiting_fn->sector_buf = entry.region_buf + static_cast<size_t>(waiting_slot) * GR_SECTOR_LEN;
+                    queue_page_for_processing(waiting_fn->sector_buf, waiting_fn);
+                    region_cache_record_use(waiting_fn->pid);
+                    region_pending_waiter_processed_count++;
+                    region_requested_page_parse_count++;
+                  }
+                  pending_region_waiters.erase(wait_it);
+                }
+                region_read_buf_to_cache_idx.erase(region_read_it);
+              }
               if (collect_region_io_trace) {
                 auto batch_it = region_io_buf_to_batch.find(tmp_bufs[i]);
                 if (batch_it != region_io_buf_to_batch.end() && batch_it->second < region_io_batches.size()) {
@@ -800,16 +1197,48 @@ namespace diskann {
                     batch.remaining--;
                     if (batch.remaining == 0) {
                       batch.submit_to_all_completion_us = region_io_getevents_end_us - batch.submit_return_us;
+                      if (batch_it->second < region_io_ts_batches.size()) {
+                        region_io_ts_batches[batch_it->second].last_completion_ns = region_io_getevents_end_ns;
+                      }
                     }
                   }
                 }
+                auto ts_req_it = region_io_buf_to_ts_request.find(tmp_bufs[i]);
+                if (ts_req_it != region_io_buf_to_ts_request.end() && ts_req_it->second < region_io_ts_requests.size()) {
+                  auto &ts_req = region_io_ts_requests[ts_req_it->second];
+                  ts_req.completion_ns = region_io_getevents_end_ns;
+                  ts_req.completion_order = region_io_completion_order++;
+                  ts_req.result_code = 0;
+                  region_io_buf_to_ts_request.erase(ts_req_it);
+                }
               }
               // update to sector buffers
-              sector_buffers.push(tmp_bufs[i]);
+              auto fn_for_process = sec_buf2ftr.find(page_buf_to_process);
+              if (fn_for_process == sec_buf2ftr.end()) {
+                fn_for_process = sec_buf2ftr.find(completed_buf);
+              }
+              if (fn_for_process == sec_buf2ftr.end()) {
+                std::cerr << "Missing FrontierNode for completed graph page" << std::endl;
+                std::exit(3);
+              }
+              queue_page_for_processing(page_buf_to_process, fn_for_process->second);
+            }
+            if (collect_region_io_trace && n_read_blks > 0) {
+              region_io_context_inflight -= n_read_blks;
+              const int64_t global_after = region_io_global_inflight.fetch_sub(n_read_blks, std::memory_order_relaxed) - n_read_blks;
+              region_io_qd_events.push_back({region_io_getevents_end_ns, static_cast<unsigned>(tid), -n_read_blks,
+                                             global_after, region_io_context_inflight, "complete"});
+            }
+            if (enable_global_qd_control && n_read_blks > 0) {
+              {
+                std::lock_guard<std::mutex> lock(global_qd_control_mutex);
+                global_qd_control_inflight -= n_read_blks;
+                if (global_qd_control_inflight < 0) global_qd_control_inflight = 0;
+              }
+              global_qd_control_cv.notify_all();
             }
             if (stats != nullptr) stats->read_disk_us += (double) part_timer.elapsed();
             n_io_in_q -= n_read_blks;
-            n_proc_in_q += n_read_blks;
           }
 
           _u32 disk_batch_size = beam_width;
@@ -834,21 +1263,75 @@ namespace diskann {
                   else
                     num_seen++;
                   n_cached_in_q++;
+                  retset[marker].flag = false;
                 } else if (loaded.find(id) != loaded.end()) {
                   unsigned* node_nbrs = (unsigned*)loaded[id];
                   unsigned nb_size = *(node_nbrs++);
                   cached_node.push(std::make_shared<CacheNode>(id, nb_size, node_nbrs, loaded_parent.find(id) == loaded_parent.end() ? INF : loaded_parent[id], true, marker));
                   num_seen++;
                   n_cached_in_q++;
+                  retset[marker].flag = false;
                 } else {
                   const unsigned pid = graph_page_id(id);
-                  if (page_visited.insert(pid).second) {
+                  bool handled_by_region_path = false;
+                  bool satisfied_from_region_cache = false;
+                  const double lookup_begin_us = enable_region_prefetch_ ? region_io_now_us() : 0.0;
+                  const unsigned rid = enable_region_prefetch_ ? prefetch_region_id(id) : INF;
+                  if (enable_region_prefetch_ && rid != INF && region_prefetch_mapping_valid_) {
+                    auto cache_it = region_id_to_cache_idx.find(rid);
+                    if (cache_it != region_id_to_cache_idx.end() && cache_it->second < query_region_cache.size() &&
+                        query_region_cache[cache_it->second].complete) {
+                      auto buf_it = region_physical_page_to_buf.find(pid);
+                      if (buf_it != region_physical_page_to_buf.end() && page_visited.insert(pid).second) {
+                        auto fn = std::make_shared<FrontierNode>(id, pid, gc_index_fid);
+                        fn->sector_buf = buf_it->second;
+                        assign_logical_request_seq(fn);
+                        queue_page_for_processing(fn->sector_buf, fn);
+                        region_cache_record_use(pid);
+                        region_requested_page_parse_count++;
+                        deterministic_logical_to_physical_coalescing_count++;
+                        num_seen++;
+                        num_ios++;
+                        if (stats != nullptr) {
+                          stats->n_ios++;
+                          stats->region_logical_graph_ios++;
+                          stats->region_cache_hits++;
+                        }
+                        satisfied_from_region_cache = true;
+                      } else {
+                        satisfied_from_region_cache = true;
+                      }
+                    } else if (pending_region_ids.find(rid) != pending_region_ids.end()) {
+                      if (page_visited.insert(pid).second) {
+                        auto fn = std::make_shared<FrontierNode>(id, pid, gc_index_fid);
+                        assign_logical_request_seq(fn);
+                        register_pending_region_waiter(rid, fn);
+                        deterministic_logical_to_physical_coalescing_count++;
+                        num_seen++;
+                        num_ios++;
+                        if (stats != nullptr) {
+                          stats->n_ios++;
+                          stats->region_logical_graph_ios++;
+                          stats->region_cache_hits++;
+                          stats->region_duplicate_load_attempts++;
+                        }
+                      }
+                      handled_by_region_path = true;
+                    }
+                  }
+                  if (enable_region_prefetch_) {
+                    region_lookup_us_accum += static_cast<uint64_t>(region_io_now_us() - lookup_begin_us);
+                  }
+                  if (!satisfied_from_region_cache && !handled_by_region_path && page_visited.insert(pid).second) {
                     num_seen++;
                     auto fn = std::make_shared<FrontierNode>(id, pid, gc_index_fid);
+                    assign_logical_request_seq(fn);
                     frontier.push_back(fn);
+                  } else if (!satisfied_from_region_cache && !handled_by_region_path) {
+                    deterministic_logical_page_duplicate_request_count++;
                   }
+                  retset[marker].flag = false;
                 }
-                retset[marker].flag = false;
               }
               marker++;
             }
@@ -860,31 +1343,169 @@ namespace diskann {
               const double region_io_construct_begin_us = collect_region_io_trace ? region_io_now_us() : 0.0;
               const size_t region_io_batch_begin = ftr_id;
               if (stats != nullptr) stats->n_hops++;
-              n_io_in_q += frontier.size() - ftr_id;
-              while(ftr_id < frontier.size()) {
-                auto sector_buf = sector_scratch + sector_scratch_idx * GR_SECTOR_LEN;
-                sector_scratch_idx = (sector_scratch_idx + 1) % MAX_N_SECTOR_READS;
-                auto offset = (static_cast<_u64>(frontier[ftr_id]->pid)) * GR_SECTOR_LEN;
-                offset += GR_SECTOR_LEN; // one page for metadata
-                frontier[ftr_id]->sector_buf = sector_buf;
-                sec_buf2ftr.insert({sector_buf, frontier[ftr_id]});
-                frontier_read_reqs.push_back(AlignedRead(offset, GR_SECTOR_LEN, sector_buf));
-                // update sector_buf for the current node.
-                if (stats != nullptr) {
-                  stats->n_ios++;
+              const size_t ready_count = frontier.size() - ftr_id;
+              size_t submit_limit = ready_count;
+              if (enable_global_qd_control) {
+                const double wait_begin_us = region_io_now_us();
+                std::unique_lock<std::mutex> lock(global_qd_control_mutex);
+                qd_control_wait_events++;
+                if (ready_count <= static_cast<size_t>(global_qd_cap)) {
+                  global_qd_control_cv.wait(lock, [&]() {
+                    return global_qd_control_inflight + static_cast<int64_t>(ready_count) <= static_cast<int64_t>(global_qd_cap);
+                  });
+                  submit_limit = ready_count;
+                } else {
+                  global_qd_control_cv.wait(lock, [&]() { return global_qd_control_inflight < static_cast<int64_t>(global_qd_cap); });
+                  const size_t available = static_cast<size_t>(static_cast<int64_t>(global_qd_cap) - global_qd_control_inflight);
+                  submit_limit = std::max<size_t>(1, std::min(ready_count, available));
+                  qd_control_split_submit_groups++;
+                }
+                global_qd_control_inflight += static_cast<int64_t>(submit_limit);
+                lock.unlock();
+                qd_control_wait_us_total += region_io_now_us() - wait_begin_us;
+              }
+              while(ftr_id < frontier.size() && frontier_read_reqs.size() < submit_limit) {
+                const unsigned owner_id = frontier[ftr_id]->id;
+                const unsigned pid = frontier[ftr_id]->pid;
+                const unsigned rid = enable_region_prefetch_ ? prefetch_region_id(owner_id) : INF;
+                if (enable_region_prefetch_ && rid != INF && region_prefetch_mapping_valid_) {
+                  auto existing_region_it = region_id_to_cache_idx.find(rid);
+                  if (existing_region_it != region_id_to_cache_idx.end() || pending_region_ids.find(rid) != pending_region_ids.end()) {
+                    if (stats != nullptr) stats->region_duplicate_load_attempts++;
+                    const bool region_complete = existing_region_it != region_id_to_cache_idx.end() &&
+                        existing_region_it->second < query_region_cache.size() && query_region_cache[existing_region_it->second].complete;
+                    if (region_complete) {
+                      auto buf_it = region_physical_page_to_buf.find(pid);
+                      if (buf_it == region_physical_page_to_buf.end()) {
+                        std::cerr << "Completed Region cache missing requested page: query_id=" << task_id
+                                  << " owner=" << owner_id << " pid=" << pid << " region=" << rid << std::endl;
+                        std::exit(3);
+                      }
+                      frontier[ftr_id]->sector_buf = buf_it->second;
+                      queue_page_for_processing(frontier[ftr_id]->sector_buf, frontier[ftr_id]);
+                      region_cache_record_use(pid);
+                      region_requested_page_parse_count++;
+                      deterministic_logical_to_physical_coalescing_count++;
+                      if (stats != nullptr) {
+                        stats->n_ios++;
+                        stats->region_logical_graph_ios++;
+                        stats->region_cache_hits++;
+                      }
+                    } else {
+                      region_same_region_pending_frontier_count++;
+                      register_pending_region_waiter(rid, frontier[ftr_id]);
+                      deterministic_logical_to_physical_coalescing_count++;
+                      if (stats != nullptr) {
+                        stats->n_ios++;
+                        stats->region_logical_graph_ios++;
+                        stats->region_cache_hits++;
+                      }
+                    }
+                    num_ios++;
+                    ftr_id++;
+                    continue;
+                  }
+                  const double manage_begin_us = region_io_now_us();
+                  const uint64_t read_bytes = static_cast<uint64_t>(region_prefetch_size_) * GR_SECTOR_LEN;
+                  if (region_cache_bytes + read_bytes > region_cache_limit_bytes_per_query_) {
+                    region_prefetch_overflow = true;
+                    if (stats != nullptr) stats->region_prefetch_overflow = 1;
+                    std::cerr << "Region cache overflow: query_id=" << task_id
+                              << " current_regions=" << query_region_cache.size()
+                              << " current_cache_bytes=" << region_cache_bytes
+                              << " request_bytes=" << read_bytes
+                              << " limit_bytes=" << region_cache_limit_bytes_per_query_ << std::endl;
+                    std::exit(3);
+                  }
+                  char *region_buf = nullptr;
+                  diskann::alloc_aligned((void **) &region_buf, read_bytes, GR_SECTOR_LEN);
+                  QueryRegionCacheEntry entry;
+                  entry.region_id = rid;
+                  entry.trigger_pid = pid;
+                  entry.physical_base = region_prefetch_physical_base_[rid];
+                  entry.region_buf = region_buf;
+                  const unsigned trigger_slot = region_cache_slot_for_physical(rid, pid);
+                  if (trigger_slot == INF || trigger_slot >= region_prefetch_size_) {
+                    region_slice_byte_mismatch_count++;
+                    std::cerr << "Region trigger page is outside contiguous physical range: query_id=" << task_id
+                              << " owner=" << owner_id << " pid=" << pid << " region=" << rid << std::endl;
+                    std::exit(3);
+                  }
+                  entry.trigger[trigger_slot] = true;
+                  entry.used[trigger_slot] = true;
+                  query_region_cache.push_back(entry);
+                  const size_t cache_idx = query_region_cache.size() - 1;
+                  region_id_to_cache_idx[rid] = cache_idx;
+                  pending_region_ids.insert(rid);
+                  region_read_buf_to_cache_idx[region_buf] = cache_idx;
+                  region_cache_bytes += read_bytes;
+                  region_cache_peak_bytes = std::max(region_cache_peak_bytes, region_cache_bytes);
+                  region_cache_allocations++;
+                  region_cache_manage_us_accum += static_cast<uint64_t>(region_io_now_us() - manage_begin_us);
+
+                  auto offset = (static_cast<_u64>(entry.physical_base)) * GR_SECTOR_LEN;
+                  offset += GR_SECTOR_LEN;
+                  if (frontier[ftr_id]->logical_request_seq == UINT64_MAX) assign_logical_request_seq(frontier[ftr_id]);
+                  frontier[ftr_id]->sector_buf = region_buf;
+                  sec_buf2ftr.insert({region_buf, frontier[ftr_id]});
+                  frontier_read_reqs.push_back(AlignedRead(offset, read_bytes, region_buf));
+                  deterministic_physical_io_submission_count++;
+                  if (stats != nullptr) {
+                    stats->n_ios++;
+                    stats->region_logical_graph_ios++;
+                    stats->region_device_read_submits++;
+                    stats->region_device_read_bytes += read_bytes;
+                    stats->region_device_16kb_reads++;
+                    stats->region_first_triggers++;
+                  }
+                } else {
+                  auto sector_buf = sector_scratch + sector_scratch_idx * GR_SECTOR_LEN;
+                  sector_scratch_idx = (sector_scratch_idx + 1) % MAX_N_SECTOR_READS;
+                  auto offset = (static_cast<_u64>(pid)) * GR_SECTOR_LEN;
+                  offset += GR_SECTOR_LEN; // one page for metadata
+                  if (frontier[ftr_id]->logical_request_seq == UINT64_MAX) assign_logical_request_seq(frontier[ftr_id]);
+                  frontier[ftr_id]->sector_buf = sector_buf;
+                  sec_buf2ftr.insert({sector_buf, frontier[ftr_id]});
+                  frontier_read_reqs.push_back(AlignedRead(offset, GR_SECTOR_LEN, sector_buf));
+                  deterministic_physical_io_submission_count++;
+                  if (stats != nullptr) {
+                    stats->n_ios++;
+                    stats->region_logical_graph_ios++;
+                    stats->region_device_read_submits++;
+                    stats->region_device_read_bytes += GR_SECTOR_LEN;
+                    stats->region_device_4kb_reads++;
+                  }
                 }
                 num_ios++;
                 ftr_id++;
               }
+              const size_t region_io_batch_end = ftr_id;
               double region_io_prep_us = 0.0;
               double region_io_submit_us = 0.0;
               const double region_io_construct_us = collect_region_io_trace ? region_io_now_us() - region_io_construct_begin_us : 0.0;
+              if (frontier_read_reqs.empty()) {
+                if (stats != nullptr) stats->read_disk_us += (double) part_timer.elapsed();
+                continue;
+              }
               if (collect_region_io_trace) {
-                io_manager->submit_read_reqs(frontier_read_reqs, gc_index_fid, ctx, &region_io_prep_us, &region_io_submit_us);
-                append_region_io_batch(frontier, region_io_batch_begin, frontier.size(),
-                                       region_io_construct_us, region_io_prep_us, region_io_submit_us, region_io_now_us());
+                const uint64_t submit_before_ns = region_io_now_ns();
+                const int64_t per_context_before = region_io_context_inflight;
+                const int64_t global_before = region_io_global_inflight.load(std::memory_order_relaxed);
+                const int submitted_count = io_manager->submit_read_reqs(frontier_read_reqs, gc_index_fid, ctx, &region_io_prep_us, &region_io_submit_us);
+                n_io_in_q += submitted_count;
+                const uint64_t submit_after_ns = region_io_now_ns();
+                region_io_context_inflight += submitted_count;
+                const int64_t global_after = region_io_global_inflight.fetch_add(submitted_count, std::memory_order_relaxed) + submitted_count;
+                region_io_qd_events.push_back({submit_after_ns, static_cast<unsigned>(tid), submitted_count,
+                                               global_after, region_io_context_inflight, "submit"});
+                append_region_io_batch(frontier, region_io_batch_begin, region_io_batch_end,
+                                       region_io_construct_us, region_io_prep_us, region_io_submit_us, region_io_now_us(),
+                                       submit_before_ns, submit_after_ns, per_context_before, region_io_context_inflight,
+                                       global_before, global_after);
               } else {
-                io_manager->submit_read_reqs(frontier_read_reqs, gc_index_fid, ctx);
+                const int submitted_count = io_manager->submit_read_reqs(frontier_read_reqs, gc_index_fid, ctx);
+                n_io_in_q += submitted_count;
+                (void) submitted_count;
               }
               if (stats != nullptr) stats->read_disk_us += (double) part_timer.elapsed();
             }
@@ -984,7 +1605,23 @@ namespace diskann {
           exit(1);
         }
 
+        region_cache_finalize_query();
+
         if (stats != nullptr) {
+          stats->deterministic_logical_page_processing_enabled = deterministic_logical_page_processing_ ? 1 : 0;
+          stats->deterministic_logical_page_request_count = deterministic_logical_page_request_count;
+          stats->deterministic_logical_request_seq_assigned_count = deterministic_logical_request_seq_assigned_count;
+          stats->deterministic_logical_page_ready_count = deterministic_logical_page_ready_count;
+          stats->deterministic_logical_page_processed_count = deterministic_logical_page_processed_count;
+          stats->deterministic_logical_page_duplicate_request_count = deterministic_logical_page_duplicate_request_count;
+          stats->deterministic_logical_page_duplicate_process_count = deterministic_logical_page_duplicate_process_count;
+          stats->deterministic_queue_insert_count = deterministic_queue_insert_count;
+          stats->deterministic_queue_max_depth = deterministic_queue_max_depth;
+          stats->deterministic_queue_leftover_at_query_end = static_cast<uint64_t>(deterministic_ready_pages.size());
+          stats->deterministic_requested_but_not_processed_count = deterministic_logical_page_request_count >= deterministic_logical_page_processed_count ? deterministic_logical_page_request_count - deterministic_logical_page_processed_count : 0;
+          stats->deterministic_processed_without_request_count = deterministic_processed_without_request_count;
+          stats->deterministic_physical_io_submission_count = deterministic_physical_io_submission_count;
+          stats->deterministic_logical_to_physical_coalescing_count = deterministic_logical_to_physical_coalescing_count;
           stats->total_us = (double) query_timer.elapsed();
           stats->postprocess_us = (double) part_timer.elapsed();
 #ifdef ENABLE_REPLICA_REDUNDANCY_STATS
@@ -1027,7 +1664,14 @@ namespace diskann {
                                                    static_cast<unsigned>(region_io_batches.size()),
                                                    region_io_request_count, region_io_submit_us_total,
                                                    region_io_wait_us_total, region_io_page_process_us_total,
-                                                   query_read_disk_us, query_total_us});
+                                                   query_read_disk_us, query_total_us, qd_control_wait_us_total,
+                                                   qd_control_wait_events, qd_control_split_submit_groups});
+          region_io_thread_ts_batches[tix].insert(region_io_thread_ts_batches[tix].end(),
+                                                  region_io_ts_batches.begin(), region_io_ts_batches.end());
+          region_io_thread_ts_requests[tix].insert(region_io_thread_ts_requests[tix].end(),
+                                                   region_io_ts_requests.begin(), region_io_ts_requests.end());
+          region_io_thread_qd_events[tix].insert(region_io_thread_qd_events[tix].end(),
+                                                 region_io_qd_events.begin(), region_io_qd_events.end());
         }
         if (collect_trace && !trace_rows.empty()) {
           std::lock_guard<std::mutex> lock(transition_trace_mutex_);
@@ -1106,7 +1750,47 @@ namespace diskann {
             writer << row.query_id << "," << row.thread_id << "," << row.graph_io_batches << ","
                    << row.graph_io_requests << "," << row.submit_us << ","
                    << row.completion_wait_us << "," << row.page_process_us << ","
-                   << row.read_disk_us << "," << row.total_us << "\n";
+                   << row.read_disk_us << "," << row.total_us << "," << row.qd_control_wait_us << ","
+                   << row.qd_control_wait_events << "," << row.qd_control_split_submit_groups << "\n";
+          }
+        }
+      }
+      {
+        std::lock_guard<std::mutex> lock(region_io_trace_mutex_);
+        std::ofstream writer(region_io_trace_dir_ + "/stage_g_batch_timeline.csv", std::ios::app);
+        for (const auto &buf : region_io_thread_ts_batches) {
+          for (const auto &row : buf) {
+            writer << row.query_id << "," << row.thread_id << "," << row.logical_batch_id << ","
+                   << row.submit_group_id << "," << row.batch_size << "," << row.submit_before_ns << ","
+                   << row.submit_after_ns << "," << row.submitted_count << ","
+                   << row.per_context_inflight_before << "," << row.per_context_inflight_after_submit << ","
+                   << row.global_inflight_before << "," << row.global_inflight_after_submit << ","
+                   << row.first_completion_ns << "," << row.last_completion_ns << ","
+                   << row.first_getevents_begin_ns << "," << row.last_getevents_end_ns << ","
+                   << row.logical_owner_key << "," << row.physical_page_key << "," << row.request_order_key << "\n";
+          }
+        }
+      }
+      {
+        std::lock_guard<std::mutex> lock(region_io_trace_mutex_);
+        std::ofstream writer(region_io_trace_dir_ + "/stage_g_request_timeline.csv", std::ios::app);
+        for (const auto &buf : region_io_thread_ts_requests) {
+          for (const auto &row : buf) {
+            writer << row.request_id << "," << row.query_id << "," << row.thread_id << ","
+                   << row.submit_group_id << "," << row.request_index << "," << row.owner_node_id << ","
+                   << row.physical_page_id << "," << row.submit_ns << "," << row.completion_ns << ","
+                   << row.completion_order << "," << row.result_code << "\n";
+          }
+        }
+      }
+      {
+        std::lock_guard<std::mutex> lock(region_io_trace_mutex_);
+        std::ofstream writer(region_io_trace_dir_ + "/stage_g_qd_events.csv", std::ios::app);
+        for (const auto &buf : region_io_thread_qd_events) {
+          for (const auto &row : buf) {
+            writer << row.timestamp_ns << "," << row.thread_id << "," << row.delta << ","
+                   << row.global_inflight_after << "," << row.per_context_inflight_after << ","
+                   << row.event << "\n";
           }
         }
       }
